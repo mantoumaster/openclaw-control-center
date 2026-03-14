@@ -425,11 +425,14 @@ test("memory and workspace sections expose editable file workbenches", async () 
   assert(source.includes('const AGENT_DOCUMENT_FILE_CANDIDATES = ['));
   assert(source.includes('"IDENTITY.md"'));
   assert(source.includes('"SOUL.md"'));
+  assert(source.includes('"USER.md"'));
+  assert(source.includes('"TASKS.md"'));
   assert(source.includes('"BOOTSTRAP.md"'));
   assert(source.includes("listMemoryFacetOptions()"));
   assert(source.includes("listWorkspaceFacetOptions()"));
   assert(source.includes("facetOptions: memoryFacetOptions"));
   assert(source.includes("facetOptions: workspaceFacetOptions"));
+  assert(source.includes('title: basename(input.sourcePath) || relativePath,'));
   assert(source.includes("defaultFacetKey: \"main\""));
   assert(source.includes("defaultFacetKey: \"main\""));
   assert(source.includes("includeAllFacet: false"));
@@ -504,9 +507,39 @@ test("memory and workspace sections expose editable file workbenches", async () 
 
 test("editable agent scopes follow configured agents before workspace folders", async () => {
   const {
+    resolveOpenClawWorkspaceRootForSmoke,
     resolveEditableAgentScopesFromConfigForSmoke,
     resolveEditableAgentScopesWithFallbackForSmoke,
   } = await import("../src/ui/server");
+
+  assert.equal(
+    resolveOpenClawWorkspaceRootForSmoke({
+      openclawHomeDir: "/home/test/.openclaw",
+      configPath: "/home/test/.openclaw/openclaw.json",
+      configText: JSON.stringify({
+        agents: {
+          list: [
+            { id: "main" },
+            { id: "pandas", workspace: "/srv/openclaw/workspace/agents/pandas" },
+          ],
+        },
+      }),
+    }),
+    "/srv/openclaw/workspace",
+  );
+  assert.equal(
+    resolveOpenClawWorkspaceRootForSmoke({
+      explicitWorkspaceRoot: "/data/openclaw/workspace",
+      openclawHomeDir: "/home/test/.openclaw",
+    }),
+    "/data/openclaw/workspace",
+  );
+  assert.equal(
+    resolveOpenClawWorkspaceRootForSmoke({
+      openclawHomeDir: "/home/test/.openclaw",
+    }),
+    "/home/test/.openclaw/workspace",
+  );
 
   const scopes = resolveEditableAgentScopesFromConfigForSmoke({
     agents: {

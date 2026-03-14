@@ -314,6 +314,9 @@ UI_PORT=4310
 
 # Optional only when your paths differ from the defaults:
 # OPENCLAW_HOME=/path/to/.openclaw
+# OPENCLAW_CONFIG_PATH=/path/to/openclaw.json
+# OPENCLAW_WORKSPACE_ROOT=/path/to/workspace
+# OPENCLAW_AGENT_ROOT=/path/to/one/agent/workspace
 # CODEX_HOME=/path/to/.codex
 # OPENCLAW_SUBSCRIPTION_SNAPSHOT_PATH=/path/to/subscription.json
 ```
@@ -321,6 +324,9 @@ UI_PORT=4310
 Change only these values if your environment needs it:
 - `GATEWAY_URL`: when your OpenClaw Gateway is not on the default local socket
 - `OPENCLAW_HOME`: when OpenClaw is not stored in `~/.openclaw`
+- `OPENCLAW_CONFIG_PATH`: when `openclaw.json` lives somewhere custom
+- `OPENCLAW_WORKSPACE_ROOT`: when control-center is installed outside the OpenClaw workspace tree and you want to pin the true workspace root
+- `OPENCLAW_AGENT_ROOT`: when control-center is not inside an agent workspace but you still want legacy agent-local memory/mission reads to point at one specific agent workspace
 - `CODEX_HOME`: when Codex data is not stored in `~/.codex`
 - `OPENCLAW_SUBSCRIPTION_SNAPSHOT_PATH`: when your billing/subscription snapshot lives somewhere custom
 - `UI_PORT`: when `4310` is already in use
@@ -359,7 +365,7 @@ On your first launch, check these pages in order:
 
 ### 8. If something looks wrong
 - Empty live activity usually means `GATEWAY_URL` is wrong or the OpenClaw Gateway is not running.
-- Missing `Documents / Memory` agents usually means `OPENCLAW_HOME` points to the wrong OpenClaw root or `openclaw.json` is missing.
+- Missing `Documents / Memory` agents usually means `OPENCLAW_HOME`, `OPENCLAW_CONFIG_PATH`, or `OPENCLAW_WORKSPACE_ROOT` points to the wrong place, or `openclaw.json` is missing.
 - Missing usage/subscription data usually means `CODEX_HOME` or `OPENCLAW_SUBSCRIPTION_SNAPSHOT_PATH` needs to be set.
 - If you only want a safe read-only dashboard, do not change the mutation defaults.
 

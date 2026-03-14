@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
@@ -127,13 +128,15 @@ import type {
 
 const SNAPSHOT_PATH = join(process.cwd(), "runtime", "last-snapshot.json");
 const OPENCLAW_HOME_DIR = process.env.OPENCLAW_HOME?.trim() || join(homedir(), ".openclaw");
+const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG_PATH?.trim() || join(OPENCLAW_HOME_DIR, "openclaw.json");
+const OPENCLAW_CONFIG_DIR = dirname(OPENCLAW_CONFIG_PATH);
 const OPENCLAW_CRON_JOBS_CANDIDATES = [
   join(OPENCLAW_HOME_DIR, "cron", "jobs.json"),
   join(process.cwd(), "..", "..", "..", "..", "cron", "jobs.json"),
 ];
 const DOCS_DIR = join(process.cwd(), "docs");
 const README_PATH = join(process.cwd(), "README.md");
-const AGENT_ROOT_DIR = join(process.cwd(), "..");
+const AGENT_ROOT_DIR = process.env.OPENCLAW_AGENT_ROOT?.trim() || join(process.cwd(), "..");
 const MEMORY_DIR_CANDIDATES = [
   join(AGENT_ROOT_DIR, "memory"),
   join(process.cwd(), "runtime", "digests"),
@@ -163,7 +166,11 @@ const EDITABLE_TEXT_CONTENT_MAX_CHARS = 240_000;
 const SEARCH_LIMIT_MAX = 200;
 const TASK_RUNTIME_ACTIVITY_WINDOW_MS = 6 * 60 * 60 * 1000;
 const STALLED_RUNNING_SESSION_WINDOW_MS = 2 * 60 * 60 * 1000;
-const OPENCLAW_WORKSPACE_ROOT = resolve(process.cwd(), "..", "..", "..");
+const OPENCLAW_WORKSPACE_ROOT = resolveOpenClawWorkspaceRoot({
+  explicitWorkspaceRoot: process.env.OPENCLAW_WORKSPACE_ROOT?.trim(),
+  openclawHomeDir: OPENCLAW_HOME_DIR,
+  configPath: OPENCLAW_CONFIG_PATH,
+});
 const WORKSPACE_EDITABLE_SKIP_DIRS = new Set(["node_modules", ".git", "dist", "coverage"]);
 const WORKSPACE_EDITABLE_EXTENSIONS = new Set([".md", ".markdown"]);
 const MEMORY_EDITABLE_EXTENSIONS = new Set([".md", ".markdown", ".txt"]);
@@ -171,6 +178,8 @@ const SHARED_DOCUMENT_FILE_CANDIDATES = [
   "AGENTS.md",
   "IDENTITY.md",
   "SOUL.md",
+  "USER.md",
+  "TASKS.md",
   "BOOTSTRAP.md",
   "HEARTBEAT.md",
   "TOOLS.md",
@@ -181,6 +190,8 @@ const AGENT_DOCUMENT_FILE_CANDIDATES = [
   "AGENTS.md",
   "IDENTITY.md",
   "SOUL.md",
+  "USER.md",
+  "TASKS.md",
   "HEARTBEAT.md",
   "TOOLS.md",
   "README.md",
@@ -214,7 +225,6 @@ const DASHBOARD_SECTIONS = [
   "settings",
 ] as const;
 const CONTROL_CENTER_MAPPING_TASK_IDS = new Set(["due-fast", "todo-second", "already-running", "unassigned"]);
-const OPENCLAW_CONFIG_PATH = join(OPENCLAW_HOME_DIR, "openclaw.json");
 const LEGACY_DASHBOARD_ROUTE_SECTION = {
   "/calendar": "projects-tasks",
   "/heartbeat": "overview",
@@ -225,6 +235,74 @@ const LEGACY_DASHBOARD_ROUTE_ANCHOR = {
   "/heartbeat": "heartbeat-health",
   "/tools": "tool-connectors",
 } as const;
+function resolveOpenClawWorkspaceRoot(input: {
+  explicitWorkspaceRoot?: string;
+  openclawHomeDir: string;
+  configPath: string;
+}): string {
+  const explicit = input.explicitWorkspaceRoot?.trim();
+  if (explicit) return resolve(explicit);
+  const configText = safeReadTextFileSync(input.configPath);
+  const inferred = inferWorkspaceRootFromConfigText(configText, dirname(input.configPath));
+  if (inferred) return inferred;
+  return join(input.openclawHomeDir, "workspace");
+}
+
+function safeReadTextFileSync(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function inferWorkspaceRootFromConfigText(raw: string | undefined, configDir: string): string | undefined {
+  if (!raw?.trim()) return undefined;
+  try {
+    return inferWorkspaceRootFromConfigObject(JSON.parse(raw) as unknown, configDir);
+  } catch {
+    return undefined;
+  }
+}
+
+function inferWorkspaceRootFromConfigObject(input: unknown, configDir: string): string | undefined {
+  const root = asObject(input);
+  const agents = asObject(root?.agents);
+  const list = asArray(agents?.list);
+  const mainRow = list
+    .map((item) => asObject(item))
+    .find((row) => normalizeLookupKey(asString(row?.id)?.trim() ?? asString(row?.name)?.trim() ?? "") === "main");
+  const explicitMainWorkspace = asString(mainRow?.workspace)?.trim();
+  if (explicitMainWorkspace) return resolve(configDir, explicitMainWorkspace);
+
+  const inferredRoots = new Set<string>();
+  for (const item of list) {
+    const row = asObject(item);
+    const rawWorkspace = asString(row?.workspace)?.trim();
+    if (!rawWorkspace) continue;
+    const workspacePath = resolve(configDir, rawWorkspace);
+    const parentDir = dirname(workspacePath);
+    if (basename(parentDir).toLowerCase() !== "agents") continue;
+    inferredRoots.add(dirname(parentDir));
+  }
+  if (inferredRoots.size === 1) return [...inferredRoots][0];
+  return undefined;
+}
+
+export function resolveOpenClawWorkspaceRootForSmoke(input: {
+  explicitWorkspaceRoot?: string;
+  openclawHomeDir: string;
+  configText?: string;
+  configPath?: string;
+}): string {
+  const explicit = input.explicitWorkspaceRoot?.trim();
+  if (explicit) return resolve(explicit);
+  const configDir = dirname(input.configPath?.trim() || join(input.openclawHomeDir, "openclaw.json"));
+  const inferred = inferWorkspaceRootFromConfigText(input.configText, configDir);
+  if (inferred) return inferred;
+  return join(input.openclawHomeDir, "workspace");
+}
+
 const TASK_STATES: TaskState[] = ["todo", "in_progress", "blocked", "done"];
 const SESSION_STATES: AgentRunState[] = ["idle", "running", "blocked", "waiting_approval", "error"];
 const DOC_LINKS = [
@@ -8663,7 +8741,9 @@ function resolveStaffWorkspaceRoot(member: TeamMemberSnapshot): string {
   const key = normalizeLookupKey(member.agentId);
   if (key === "main") return OPENCLAW_WORKSPACE_ROOT;
   const workspace = member.workspace.trim();
-  if (workspace && workspace !== "未标注" && workspace !== "unlisted") return workspace;
+  if (workspace && workspace !== "未标注" && workspace !== "unlisted") {
+    return resolve(OPENCLAW_CONFIG_DIR, workspace);
+  }
   return join(OPENCLAW_WORKSPACE_ROOT, "agents", member.agentId);
 }
 
@@ -8834,13 +8914,12 @@ async function buildEditableFileEntry(input: {
     if (!meta.isFile() || meta.size > EDITABLE_TEXT_FILE_MAX_BYTES) return undefined;
     const raw = await safeReadTextFile(input.sourcePath);
     if (raw === undefined) return undefined;
-    const ext = extname(input.sourcePath).toLowerCase();
     const relativePath = input.relativeBase
       ? relative(input.relativeBase, input.sourcePath) || basename(input.sourcePath)
       : basename(input.sourcePath);
     return {
       scope: input.scope,
-      title: extractMarkdownHeading(raw) || basename(input.sourcePath, ext) || basename(input.sourcePath),
+      title: basename(input.sourcePath) || relativePath,
       excerpt: toPlainSummary(raw, 160),
       category: input.category,
       sourcePath: input.sourcePath,
@@ -9038,6 +9117,8 @@ function documentFilePriority(relativePath: string): number {
     "agents.md",
     "identity.md",
     "soul.md",
+    "user.md",
+    "tasks.md",
     "bootstrap.md",
     "heartbeat.md",
     "tools.md",
@@ -9127,7 +9208,7 @@ function resolveEditableAgentScopesFromConfig(input: unknown): EditableAgentScop
     const workspaceRoot =
       facetKey === "main"
         ? OPENCLAW_WORKSPACE_ROOT
-        : resolve(asString(row.workspace)?.trim() || join(OPENCLAW_WORKSPACE_ROOT, "agents", rawId));
+        : resolveConfiguredWorkspaceRoot(asString(row.workspace)?.trim(), rawId);
     output.push({
       agentId: rawId,
       facetKey,
@@ -9209,6 +9290,12 @@ function resolveEditableAgentScopesFromWorkspaceAgentIds(agentIds: string[]): Ed
     });
   }
   return scopes.sort(compareEditableAgentScopes);
+}
+
+function resolveConfiguredWorkspaceRoot(rawWorkspace: string | undefined, agentId: string): string {
+  const workspace = rawWorkspace?.trim();
+  if (workspace) return resolve(OPENCLAW_CONFIG_DIR, workspace);
+  return join(OPENCLAW_WORKSPACE_ROOT, "agents", agentId);
 }
 
 async function resolveEditableFileEntry(

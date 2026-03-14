@@ -67,6 +67,9 @@ Phase 3: apply safe first-run settings
 15. Only change these when the machine actually requires it:
    - GATEWAY_URL
    - OPENCLAW_HOME
+   - OPENCLAW_CONFIG_PATH
+   - OPENCLAW_WORKSPACE_ROOT
+   - OPENCLAW_AGENT_ROOT
    - CODEX_HOME
    - OPENCLAW_SUBSCRIPTION_SNAPSHOT_PATH
    - UI_PORT

@@ -1,5 +1,34 @@
 # Progress
 
+## Phase 154 (Workspace root overrides and USER/TASKS doc discovery) — Completed
+- Scope:
+  - Fix document and memory file discovery when control-center is installed outside the OpenClaw workspace tree.
+  - Expose `USER.md` and `TASKS.md` in the workspace file workbench instead of silently omitting them.
+- Changed files:
+  - `src/ui/server.ts`
+  - `.env.example`
+  - `README.md`
+  - `README.en.md`
+  - `INSTALL_PROMPT.md`
+  - `INSTALL_PROMPT.en.md`
+  - `test/ui-render-smoke.test.ts`
+  - `docs/PROGRESS.md`
+- Implementation:
+  - Added explicit support for `OPENCLAW_CONFIG_PATH`, `OPENCLAW_WORKSPACE_ROOT`, and `OPENCLAW_AGENT_ROOT` in the UI server path resolution layer.
+  - Replaced the hardcoded `process.cwd()`-relative workspace-root assumption with a safer resolution order:
+    - explicit `OPENCLAW_WORKSPACE_ROOT`
+    - inferred workspace root from `openclaw.json`
+    - fallback to `OPENCLAW_HOME/workspace`
+  - Resolved configured agent workspace paths relative to the OpenClaw config directory so relative `workspace` entries no longer break when control-center is installed elsewhere.
+  - Added `USER.md` and `TASKS.md` to both shared and per-agent workspace document candidates, and raised their sort priority so they surface naturally in the workbench.
+  - Extended install docs and copy-paste install prompts so standalone installs outside the workspace tree now point users to the correct override envs instead of leaving discovery to fail silently.
+- Verification:
+  - `npm run build`
+  - `npm test`
+  - `npm run smoke:ui`
+- Remaining gap:
+  - The legacy agent-local memory summary helpers still use `OPENCLAW_AGENT_ROOT` for a few non-workbench fallbacks. Workbench discovery is fixed, but fully decoupling every legacy fallback from repo location can be done later if standalone users report it.
+
 ## Phase 153 (CLI insight cards for connection, memory, context, security, and update state) — Completed
 - Scope:
   - Add high-value OpenClaw CLI visibility surfaces without changing the existing information architecture, visual style, or operator workflows.

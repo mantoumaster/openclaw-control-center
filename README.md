@@ -300,6 +300,9 @@ UI_PORT=4310
 
 # 只有路径不是默认值时才需要设置：
 # OPENCLAW_HOME=/path/to/.openclaw
+# OPENCLAW_CONFIG_PATH=/path/to/openclaw.json
+# OPENCLAW_WORKSPACE_ROOT=/path/to/workspace
+# OPENCLAW_AGENT_ROOT=/path/to/one/agent/workspace
 # CODEX_HOME=/path/to/.codex
 # OPENCLAW_SUBSCRIPTION_SNAPSHOT_PATH=/path/to/subscription.json
 ```
@@ -307,6 +310,9 @@ UI_PORT=4310
 一般只需要在这些情况下修改：
 - `GATEWAY_URL`：你的 Gateway 不在默认本地地址
 - `OPENCLAW_HOME`：OpenClaw 不在 `~/.openclaw`
+- `OPENCLAW_CONFIG_PATH`：`openclaw.json` 不在默认位置
+- `OPENCLAW_WORKSPACE_ROOT`：control-center 装在工作区树外，需要显式指定工作区根目录
+- `OPENCLAW_AGENT_ROOT`：control-center 不在某个 agent 工作区内，但你仍希望旧版记忆/说明读取链指向指定 agent
 - `CODEX_HOME`：Codex 数据不在 `~/.codex`
 - `OPENCLAW_SUBSCRIPTION_SNAPSHOT_PATH`：订阅或账单快照文件在自定义位置
 - `UI_PORT`：`4310` 已被占用
@@ -344,7 +350,7 @@ UI_MODE=true npm run dev
 
 ### 8. 如果看起来不对
 - 实时活动全空，通常是 `GATEWAY_URL` 错了，或者 OpenClaw Gateway 没启动
-- `文档 / 记忆` 范围不对，通常是 `OPENCLAW_HOME` 指错了，或者 `openclaw.json` 不可读
+- `文档 / 记忆` 范围不对，通常是 `OPENCLAW_HOME` / `OPENCLAW_CONFIG_PATH` / `OPENCLAW_WORKSPACE_ROOT` 指错了，或者 `openclaw.json` 不可读
 - `用量 / 订阅` 没数据，通常是 `CODEX_HOME` 或 `OPENCLAW_SUBSCRIPTION_SNAPSHOT_PATH` 没配对
 - 如果你只是想先安全观察，不要改默认的只读和 mutation 开关
 
