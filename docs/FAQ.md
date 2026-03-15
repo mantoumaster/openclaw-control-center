@@ -1,4 +1,4 @@
-# 常见问题指南 / FAQ Guide
+# 常见问题与最佳实践 / FAQ & Best Practices
 
 > Looking for English? See [FAQ Guide (English)](#english-version) below.
 
@@ -8,7 +8,7 @@
 
 **问题：** 已经在 `SOUL.md` 和 `AGENTS.md` 中写好了角色和职责，但控制中心的员工页面看不到具体分工。
 
-**原因：** 控制中心从 OpenClaw 的 workspace 目录读取文件。显示的信息取决于：
+**常见原因：** 控制中心会参考 OpenClaw 的 workspace 目录和运行时信号。是否能看到完整职责信息，通常取决于：
 - OpenClaw Gateway 返回的 session 数据中是否包含 agent 元信息
 - `OPENCLAW_AGENT_ROOT` 环境变量是否指向了正确的 workspace 目录
 
@@ -35,13 +35,13 @@
    ```
    控制中心通过 Gateway API 获取 agent 列表和状态。如果 Gateway 没运行，员工页会显示空白或错误。
 
-4. **员工页显示的信息来源：**
-   - **名字/emoji** → 从 `IDENTITY.md` 读取
-   - **状态（执行中/空闲）** → 从 Gateway 的 session 数据实时获取
-   - **workspace** → 从 agent 配置中的 `workspace` 字段获取
-   - **具体职责描述** → 目前不会自动从 `SOUL.md` 提取摘要显示在列表中
+4. **员工页信息通常会参考这些来源：**
+   - **名字/emoji** → 常见做法是放在 `IDENTITY.md`
+   - **状态（执行中/空闲）** → 主要来自 Gateway 的 session 运行信号
+   - **workspace** → 通常来自 agent 配置中的 `workspace` 字段
+   - **具体职责描述** → 更适合作为文档线索保存在 `IDENTITY.md`、`SOUL.md`、`AGENTS.md`
 
-> **提示：** 如果想在员工列表中看到职责说明，建议在 `IDENTITY.md` 中添加一行简短描述。控制中心会优先读取此文件的关键信息。
+> **最佳实践：** 如果你希望控制中心更容易展示身份与职责线索，建议优先把简短身份说明写进 `IDENTITY.md`，并把详细角色说明写进 `SOUL.md` / `AGENTS.md`。
 
 ---
 
@@ -49,9 +49,9 @@
 
 **问题：** 用量页面有费用数据，但不知道这些数据从哪来、限额怎么设置。
 
-**数据来源：**
+**数据来源（常见情况）：**
 
-控制中心的用量数据**全部来自 OpenClaw Gateway**，不需要额外接入第三方账单系统。
+控制中心的主要用量数据通常来自 OpenClaw Gateway，不需要额外接入第三方账单系统。
 
 ```
 OpenClaw Gateway → 记录每次 API 调用的 token 用量
@@ -59,26 +59,9 @@ OpenClaw Gateway → 记录每次 API 调用的 token 用量
                  → 控制中心通过 API 拉取显示
 ```
 
-**限额设置方式：**
+**限额设置方式（最佳实践）：**
 
-限额（Budget）通过 OpenClaw 的配置文件设置，不在控制中心 UI 中设置：
-
-```yaml
-# 在 OpenClaw 配置中设置 budget
-# ~/.openclaw/config.yaml 或对应配置文件
-
-budget:
-  # Token 限额
-  tokensIn: 1000000        # 输入 token 上限
-  tokensOut: 500000         # 输出 token 上限
-  totalTokens: 1500000      # 总 token 上限
-  
-  # 费用限额（美元）
-  cost: 50.00               # 总费用上限
-  
-  # 预警比例（达到此比例时发出警告）
-  warnRatio: 0.8            # 80% 时预警
-```
+预算/限额通常在你的 OpenClaw 配置里设置，而不是在控制中心 UI 里直接填写。具体字段名和写法，请以你当前使用的 OpenClaw 版本与官方文档为准。
 
 **控制中心显示的内容：**
 - **用量页 → Token 消耗：** 按 agent、按模型、按时间段的 token 使用
@@ -86,7 +69,7 @@ budget:
 - **用量页 → 上下文压力：** 哪些 session 接近上下文窗口上限
 - **总览页 → 预算摘要：** 当前用量 vs 限额的进度条
 
-> **注意：** 如果你用的是 API key 直连模式（不通过 OpenClaw 的 billing 代理），费用数据可能不完整。建议通过 OpenClaw Gateway 统一管理 API 调用。
+> **最佳实践：** 如果你希望控制中心看到更完整的一致用量，建议尽量通过 OpenClaw Gateway 统一管理 API 调用。
 
 ---
 
@@ -94,9 +77,9 @@ budget:
 
 **问题：** 控制中心显示某个会话"停滞执行"，但找不到是哪个会话，也不确定判定标准。
 
-**判定逻辑：**
+**判定逻辑（控制中心视角）：**
 
-控制中心通过以下逻辑判定会话状态：
+控制中心会根据当前拿到的运行信号，把会话整理成类似下面这些可读状态：
 
 | 状态 | 英文 | 判定条件 |
 |------|------|----------|
@@ -106,13 +89,13 @@ budget:
 | 等待审批 | `waiting_approval` | 会话需要用户手动确认才能继续 |
 | 错误 | `error` | 会话遇到错误 |
 
-**"停滞执行"判定：** 当一个会话的状态是 `running`，但长时间没有新的 API 调用或消息更新时，控制中心会将其标记为停滞。具体来说：
+**“停滞执行”通常表示：** 控制中心看到某个会话仍在运行态，但最近缺少新的活动信号，因此将它标记为疑似停滞。常见参考信号包括：
 
 1. **Gateway 层面：** OpenClaw Gateway 跟踪每个 session 的最后活跃时间
 2. **控制中心层面：** 定期轮询 Gateway，比较 `running` 状态会话的最后活跃时间
-3. **健康检查：** 如果 session 数据长期不更新，health endpoint 返回 `stale` 状态
+3. **健康检查：** 某些环境里还会结合健康状态或 freshness 信号
 
-**如何找到停滞的会话：**
+**如何进一步确认：**
 
 ```bash
 # 查看所有 running 状态的 sessions
@@ -122,13 +105,13 @@ openclaw sessions list --filter running
 openclaw sessions history <session-key> --limit 5
 ```
 
-**如何处理停滞会话：**
-- 如果是 heartbeat 检查导致的误判，检查 `HEARTBEAT.md` 配置
-- 如果确实停滞了，可以手动发消息恢复：
+**常见处理方式：**
+- 如果是 heartbeat 检查导致的误判，先回到会话详情看最近活动
+- 如果确实停滞了，可以尝试手动发消息恢复：
   ```bash
   openclaw sessions send <session-key> "继续"
   ```
-- 如果需要终止，直接关闭对应的 agent session
+- 如果仍无进展，再考虑终止或重启对应 session
 
 ---
 
@@ -138,26 +121,20 @@ openclaw sessions history <session-key> --limit 5
 
 **Issue:** Roles defined in `SOUL.md` and `AGENTS.md` don't appear in the Control Center staff list.
 
-**Solution:**
+**Common guidance / best practice:**
 - Ensure your workspace directory follows the standard structure (`SOUL.md`, `IDENTITY.md`, `AGENTS.md`, `MEMORY.md`)
 - Set `OPENCLAW_AGENT_ROOT` environment variable to point to the parent directory of all workspaces
 - Confirm OpenClaw Gateway is running (`openclaw gateway status`)
-- The staff page reads identity info from `IDENTITY.md` — add a short description there for it to appear in the list
+- A practical best practice is to put short identity/role hints in `IDENTITY.md`, and longer role definitions in `SOUL.md` / `AGENTS.md`
 
 ### 2. Billing & Budget — How to Connect Data and Set Limits?
 
-**Data source:** All usage data comes from OpenClaw Gateway. No third-party billing integration is needed.
+**Data source (common case):** Most usage data shown in the Control Center comes from OpenClaw Gateway. No third-party billing integration is usually required.
 
-**Setting limits:** Configure budget thresholds in your OpenClaw config file (`~/.openclaw/config.yaml`):
-```yaml
-budget:
-  totalTokens: 1500000
-  cost: 50.00
-  warnRatio: 0.8
-```
+**Setting limits:** A common best practice is to configure budget thresholds in your OpenClaw config. The exact field names depend on your OpenClaw version and setup.
 
 ### 3. Session Stall Detection — How Does It Work?
 
-A session is considered "stalled" when its state is `running` but no new API calls or messages have been recorded for an extended period. Use `openclaw sessions list --filter running` to find stalled sessions.
+A session is usually treated as "stalled" when the Control Center still sees it as running but recent activity signals stop updating for a while. Use `openclaw sessions list --filter running` to review candidates.
 
-To resolve: send a message to the session (`openclaw sessions send <key> "continue"`) or terminate it.
+Best-practice next step: inspect recent session activity first, then optionally send a message to the session (`openclaw sessions send <key> "continue"`). If it still does not recover, terminate or restart the session.
