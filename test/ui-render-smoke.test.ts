@@ -570,8 +570,8 @@ test("editable agent scopes follow configured agents before workspace folders", 
 
   assert.equal(
     resolveOpenClawWorkspaceRootForSmoke({
-      openclawHomeDir: "/home/test/.openclaw",
-      configPath: "/home/test/.openclaw/openclaw.json",
+      openclawHomeDir: "/tmp/openclaw-home/.openclaw",
+      configPath: "/tmp/openclaw-home/.openclaw/openclaw.json",
       configText: JSON.stringify({
         agents: {
           list: [
@@ -586,15 +586,15 @@ test("editable agent scopes follow configured agents before workspace folders", 
   assert.equal(
     resolveOpenClawWorkspaceRootForSmoke({
       explicitWorkspaceRoot: "/data/openclaw/workspace",
-      openclawHomeDir: "/home/test/.openclaw",
+      openclawHomeDir: "/tmp/openclaw-home/.openclaw",
     }),
     "/data/openclaw/workspace",
   );
   assert.equal(
     resolveOpenClawWorkspaceRootForSmoke({
-      openclawHomeDir: "/home/test/.openclaw",
+      openclawHomeDir: "/tmp/openclaw-home/.openclaw",
     }),
-    "/home/test/.openclaw/workspace",
+    "/tmp/openclaw-home/.openclaw/workspace",
   );
 
   const scopes = resolveEditableAgentScopesFromConfigForSmoke({

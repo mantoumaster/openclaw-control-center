@@ -2,6 +2,60 @@ export interface SessionsListRequest {
   limit?: number;
 }
 
+export type AgentRunThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export interface AgentRunArtifactRef {
+  artifactId?: string;
+  type?: string;
+  label: string;
+  location: string;
+}
+
+export interface AgentRunAttachmentRef {
+  label: string;
+  url: string;
+  mimeType?: string;
+}
+
+export interface AgentRunTransportContext {
+  surface?: string;
+  workspaceRoot?: string;
+  workdir?: string;
+  entryFiles?: string[];
+  artifactRefs?: AgentRunArtifactRef[];
+  attachmentRefs?: AgentRunAttachmentRef[];
+}
+
+export interface AgentRunRequest {
+  agentId?: string;
+  sessionKey?: string;
+  sessionId?: string;
+  message: string;
+  thinking?: AgentRunThinkingLevel;
+  timeoutSeconds?: number;
+  deliver?: boolean;
+  context?: AgentRunTransportContext;
+}
+
+export interface AgentRunResponse {
+  ok: boolean;
+  runId?: string;
+  status?: string;
+  summary?: string;
+  text: string;
+  rawText: string;
+  sessionId?: string;
+  sessionKey?: string;
+  provider?: string;
+  model?: string;
+  rawJson?: Record<string, unknown>;
+}
+
+export interface AgentRunStreamHandlers {
+  onStdoutChunk?: (chunk: string) => void;
+  onStderrChunk?: (chunk: string) => void;
+}
+
 export interface SessionsListItem {
   key?: string;
   sessionKey?: string;

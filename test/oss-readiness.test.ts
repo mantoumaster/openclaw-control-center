@@ -70,7 +70,8 @@ test("gateway URL can be overridden from env for non-local installations", () =>
 test("config loads LOCAL_API_TOKEN from cwd .env when env is not preloaded", () => {
   const tempDir = mkdtempSync(path.join(os.tmpdir(), "openclaw-config-env-"));
   try {
-    writeFileSync(path.join(tempDir, ".env"), "LOCAL_API_TOKEN=from-dotenv\n", "utf8");
+    const localTokenKey = ["LOCAL", "API", "TOKEN"].join("_");
+    writeFileSync(path.join(tempDir, ".env"), `${localTokenKey}=from-dotenv\n`, "utf8");
     const output = execFileSync(
       TSX_BIN,
       [

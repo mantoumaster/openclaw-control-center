@@ -1,6 +1,8 @@
-import { execFile } from "node:child_process";
+import { exec, execFile } from "node:child_process";
+import { delimiter, join, win32 as win32Path } from "node:path";
 import { promisify } from "node:util";
 
+const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 const INSIGHT_CACHE_TTL_MS = 15_000;
 const INSIGHT_COMMAND_TIMEOUT_MS = 4_000;
@@ -127,6 +129,7 @@ export function summarizeOpenClawConnection(statusJson: unknown, gatewayJson: un
   const now = new Date().toISOString();
   const statusRoot = asObject(statusJson) ?? {};
   const gatewayRoot = asObject(gatewayJson) ?? {};
+  const statusGateway = asObject(statusRoot.gateway);
   const gatewayService = asObject(gatewayRoot.service);
   const gatewayRuntime = asObject(gatewayService?.runtime);
   const gatewayConfig = asObject(gatewayRoot.config);
@@ -143,32 +146,42 @@ export function summarizeOpenClawConnection(statusJson: unknown, gatewayJson: un
     return (asNumber(obj?.sessionsCount) ?? 0) > 0;
   }).length;
   const hasRuntimeSnapshot = sessions !== undefined || statusAgents !== undefined || asString(statusRoot.runtimeVersion) !== undefined;
+  const gatewayReachableFromStatus = asBoolean(statusGateway?.reachable) === true;
+  const gatewayUrlFromStatus = asString(statusGateway?.url);
+  const hasConfigProbe = cliConfig !== undefined || daemonConfig !== undefined;
 
   const gatewayRunning =
     asBoolean(gatewayRpc?.ok) === true ||
     asString(gatewayRuntime?.status) === "running" ||
     asString(gatewayRuntime?.state) === "active" ||
-    (asBoolean(gatewayService?.loaded) === true && gatewayRuntime !== undefined);
-  const gatewayStatus: OpenClawInsightStatus = gatewayRunning ? "ok" : "blocked";
-  const gatewayProbeUrl = asString(gatewayMeta?.probeUrl);
+    (asBoolean(gatewayService?.loaded) === true && gatewayRuntime !== undefined) ||
+    gatewayReachableFromStatus;
+  const gatewayStatus: OpenClawInsightStatus = gatewayRunning ? "ok" : hasRuntimeSnapshot ? "info" : "blocked";
   const gatewayDetail = gatewayRunning
-    ? `${gatewayProbeUrl ?? "Gateway"}`
-    : "Gateway is not reachable";
-  const gatewayValue = gatewayRunning ? "Connected" : "Unavailable";
+    ? `${asString(gatewayMeta?.probeUrl) ?? gatewayUrlFromStatus ?? "Gateway"}`
+    : hasRuntimeSnapshot
+      ? "Runtime data is flowing, but the direct Gateway probe is unavailable on this host"
+      : "Gateway is not reachable";
+  const gatewayValue = gatewayRunning ? "Connected" : hasRuntimeSnapshot ? "Partial" : "Unavailable";
 
   const cliValid = asBoolean(cliConfig?.exists) === true && asBoolean(cliConfig?.valid) === true;
   const daemonValid = asBoolean(daemonConfig?.exists) === true && asBoolean(daemonConfig?.valid) === true;
   const allowedOrigins = asArray(
     asObject(cliConfig?.controlUi)?.allowedOrigins ?? asObject(daemonConfig?.controlUi)?.allowedOrigins,
   ).length;
-  const configStatus: OpenClawInsightStatus = cliValid && daemonValid ? "ok" : "blocked";
+  const configStatus: OpenClawInsightStatus = cliValid && daemonValid ? "ok" : hasConfigProbe ? "blocked" : hasRuntimeSnapshot ? "info" : "blocked";
   const configDetail =
     cliValid && daemonValid
       ? allowedOrigins > 0
         ? `${allowedOrigins} allowed origin${allowedOrigins === 1 ? "" : "s"}`
         : "Local-only by default"
-      : "openclaw.json is missing or invalid";
-  const configValue = cliValid && daemonValid ? "Ready" : "Needs fix";
+      : hasConfigProbe
+        ? "openclaw.json is missing or invalid"
+        : hasRuntimeSnapshot
+          ? "Runtime data is visible, but config validation is unavailable on this host"
+          : "openclaw.json probe is unavailable";
+  const configValue =
+    cliValid && daemonValid ? "Ready" : hasConfigProbe ? "Needs fix" : hasRuntimeSnapshot ? "Partial" : "Unknown";
 
   const runtimeStatus: OpenClawInsightStatus = !hasRuntimeSnapshot
     ? "info"
@@ -439,17 +452,96 @@ async function runOpenClawJson(
   fallback: unknown,
   options?: { timeoutMs?: number },
 ): Promise<unknown> {
-  try {
-    const { stdout } = await execFileAsync("openclaw", args, {
-      timeout: options?.timeoutMs ?? INSIGHT_COMMAND_TIMEOUT_MS,
-      maxBuffer: INSIGHT_COMMAND_MAX_BUFFER,
-      shell: process.platform === "win32",
-    });
-    return parseEmbeddedJson(stdout) ?? fallback;
-  } catch (error) {
-    const recovered = recoverOpenClawCommandJson(error);
-    return recovered ?? fallback;
+  const candidates = buildOpenClawCommandCandidates();
+  const env = buildOpenClawCommandEnv();
+  const timeout = options?.timeoutMs ?? INSIGHT_COMMAND_TIMEOUT_MS;
+  let lastError: unknown;
+
+  for (const command of candidates) {
+    try {
+      if (process.platform === "win32") {
+        const commandLine = [quoteWindowsCommand(command), ...args.map((item) => quoteWindowsCommand(item))].join(" ");
+        const { stdout } = await execAsync(commandLine, {
+          env,
+          timeout,
+          maxBuffer: INSIGHT_COMMAND_MAX_BUFFER,
+          windowsHide: true,
+        });
+        return parseEmbeddedJson(stdout) ?? fallback;
+      }
+
+      const { stdout } = await execFileAsync(command, args, {
+        env,
+        timeout,
+        maxBuffer: INSIGHT_COMMAND_MAX_BUFFER,
+      });
+      return parseEmbeddedJson(stdout) ?? fallback;
+    } catch (error) {
+      const recovered = recoverOpenClawCommandJson(error);
+      if (recovered !== undefined) return recovered;
+      lastError = error;
+      if (!shouldTryNextOpenClawCommand(error)) {
+        return fallback;
+      }
+    }
   }
+
+  const recovered = recoverOpenClawCommandJson(lastError);
+  return recovered ?? fallback;
+}
+
+export function buildOpenClawCommandCandidates(
+  env: NodeJS.ProcessEnv = process.env,
+  platformName: NodeJS.Platform = process.platform,
+): string[] {
+  const explicit = (env.OPENCLAW_BIN_PATH ?? env.OPENCLAW_BIN ?? "").trim();
+  const candidates = [explicit, "openclaw"];
+  if (platformName === "win32") {
+    candidates.push("openclaw.cmd");
+  }
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+export function buildOpenClawCommandEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  platformName: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  if (platformName !== "win32") {
+    return { ...env };
+  }
+
+  const pathEntries = (env.PATH ?? "")
+    .split(delimiter)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const npmPrefix = (env.npm_config_prefix ?? env.NPM_CONFIG_PREFIX ?? env.PREFIX ?? "").trim();
+  const joinPath = platformName === "win32" ? win32Path.join : join;
+  const windowsBinRoots = [
+    (env.APPDATA ?? "").trim() ? joinPath((env.APPDATA ?? "").trim(), "npm") : "",
+    (env.USERPROFILE ?? "").trim() ? joinPath((env.USERPROFILE ?? "").trim(), "AppData", "Roaming", "npm") : "",
+    npmPrefix,
+  ].filter(Boolean);
+  const mergedPath = [...new Set([...windowsBinRoots, ...pathEntries])].join(delimiter);
+  return {
+    ...env,
+    PATH: mergedPath,
+  };
+}
+
+function shouldTryNextOpenClawCommand(error: unknown): boolean {
+  const root = asObject(error);
+  const code = root?.code;
+  if (code === "ENOENT") return true;
+  if (process.platform !== "win32") return false;
+  const stderr = typeof root?.stderr === "string" ? root.stderr : "";
+  const message = typeof root?.message === "string" ? root.message : "";
+  const combined = `${stderr}\n${message}`;
+  return /not recognized as an internal or external command/i.test(combined) || /cannot find the file specified/i.test(combined);
+}
+
+function quoteWindowsCommand(value: string): string {
+  if (!/[\s"]/u.test(value)) return value;
+  return `"${value.replace(/"/g, '\\"')}"`;
 }
 
 export function recoverOpenClawCommandJson(error: unknown): unknown {

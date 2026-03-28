@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { getRuntimeDir, resolveRuntimePath } from "./runtime-path";
 import type {
   BudgetThresholds,
   ProjectRecord,
@@ -7,8 +7,8 @@ import type {
   ProjectStoreSnapshot,
 } from "../types";
 
-const RUNTIME_DIR = join(process.cwd(), "runtime");
-export const PROJECTS_PATH = join(RUNTIME_DIR, "projects.json");
+const RUNTIME_DIR = getRuntimeDir();
+export const PROJECTS_PATH = resolveRuntimePath("projects.json");
 const DEFAULT_WARN_RATIO = 0.8;
 const PROJECT_ID_REGEX = /^[A-Za-z0-9._:-]+$/;
 

@@ -61,26 +61,32 @@ test("usage-cost snapshot uses runtime session events for real requests, trends,
     costLimit: 50,
   });
 
-  const now = Date.now();
-  const usage = computeUsageCostSnapshot(snapshot, [], [], {
-    sourceStatus: "connected",
-    sessionContexts: [
-      {
-        sessionKey: "s-1",
-        sessionId: "sid-1",
-        agentId: "pandas",
-        model: "gpt-5.3-codex",
-        provider: "OpenAI",
-        contextWindowTokens: 100000,
-      },
-    ],
-    events: [
-      runtimeEvent(now, 1000, 1),
-      runtimeEvent(now - 2 * 60 * 60 * 1000, 2000, 2),
-      runtimeEvent(now - 1 * 24 * 60 * 60 * 1000, 4000, 3),
-      runtimeEvent(now - 8 * 24 * 60 * 60 * 1000, 5000, 4),
-    ],
-  });
+  // Keep the reference point comfortably inside the day so "today" stays stable
+  // regardless of when the suite runs in CI or on local machines.
+  const now = Date.parse("2026-03-26T12:00:00.000Z");
+  const usage = withFrozenNow(
+    now,
+    () =>
+      computeUsageCostSnapshot(snapshot, [], [], {
+        sourceStatus: "connected",
+        sessionContexts: [
+          {
+            sessionKey: "s-1",
+            sessionId: "sid-1",
+            agentId: "pandas",
+            model: "gpt-5.3-codex",
+            provider: "OpenAI",
+            contextWindowTokens: 100000,
+          },
+        ],
+        events: [
+          runtimeEvent(now, 1000, 1),
+          runtimeEvent(now - 2 * 60 * 60 * 1000, 2000, 2),
+          runtimeEvent(now - 1 * 24 * 60 * 60 * 1000, 4000, 3),
+          runtimeEvent(now - 8 * 24 * 60 * 60 * 1000, 5000, 4),
+        ],
+      }),
+  );
 
   const today = usage.periods.find((item) => item.key === "today");
   const seven = usage.periods.find((item) => item.key === "7d");
@@ -183,24 +189,28 @@ test("usage-cost wham parser surfaces real Codex App quota windows", async () =>
 
 test("usage-cost snapshot backfills subscription consumed from runtime usage when provider snapshot is missing", async () => {
   const { computeUsageCostSnapshot } = await import("../src/runtime/usage-cost");
-  const now = Date.now();
-  const usage = computeUsageCostSnapshot(
-    buildSnapshotFixture({
-      cost: 0,
-    }),
-    [],
-    [],
-    {
-      sourceStatus: "connected",
-      sessionContexts: [
+  const now = Date.parse("2026-03-26T12:00:00.000Z");
+  const usage = withFrozenNow(
+    now,
+    () =>
+      computeUsageCostSnapshot(
+        buildSnapshotFixture({
+          cost: 0,
+        }),
+        [],
+        [],
         {
-          sessionKey: "s-1",
-          sessionId: "sid-1",
-          agentId: "pandas",
+          sourceStatus: "connected",
+          sessionContexts: [
+            {
+              sessionKey: "s-1",
+              sessionId: "sid-1",
+              agentId: "pandas",
+            },
+          ],
+          events: [runtimeEvent(now, 1000, 1), runtimeEvent(now - 30 * 60 * 1000, 1200, 2)],
         },
-      ],
-      events: [runtimeEvent(now, 1000, 1), runtimeEvent(now - 30 * 60 * 1000, 1200, 2)],
-    },
+      ),
   );
 
   assert.equal(usage.subscription.status, "not_connected");
@@ -222,25 +232,29 @@ test("usage-cost snapshot backfills subscription consumed from runtime usage whe
 
 test("usage-cost snapshot backfills subscription limit and remaining from budget when provider snapshot is missing", async () => {
   const { computeUsageCostSnapshot } = await import("../src/runtime/usage-cost");
-  const now = Date.now();
-  const usage = computeUsageCostSnapshot(
-    buildSnapshotFixture({
-      cost: 0,
-      costLimit: 10,
-    }),
-    [],
-    [],
-    {
-      sourceStatus: "connected",
-      sessionContexts: [
+  const now = Date.parse("2026-03-26T12:00:00.000Z");
+  const usage = withFrozenNow(
+    now,
+    () =>
+      computeUsageCostSnapshot(
+        buildSnapshotFixture({
+          cost: 0,
+          costLimit: 10,
+        }),
+        [],
+        [],
         {
-          sessionKey: "s-1",
-          sessionId: "sid-1",
-          agentId: "pandas",
+          sourceStatus: "connected",
+          sessionContexts: [
+            {
+              sessionKey: "s-1",
+              sessionId: "sid-1",
+              agentId: "pandas",
+            },
+          ],
+          events: [runtimeEvent(now, 1000, 1), runtimeEvent(now - 30 * 60 * 1000, 1200, 2)],
         },
-      ],
-      events: [runtimeEvent(now, 1000, 1), runtimeEvent(now - 30 * 60 * 1000, 1200, 2)],
-    },
+      ),
   );
 
   assert.equal(usage.subscription.status, "not_connected");
@@ -557,4 +571,14 @@ function runtimeEvent(timestampMs: number, tokens: number, cost: number) {
     tokens,
     cost,
   };
+}
+
+function withFrozenNow<T>(nowMs: number, fn: () => T): T {
+  const originalDateNow = Date.now;
+  Date.now = () => nowMs;
+  try {
+    return fn();
+  } finally {
+    Date.now = originalDateNow;
+  }
 }

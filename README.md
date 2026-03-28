@@ -20,12 +20,17 @@ Language: **English** | [中文](README.zh-CN.md)
 - `Overview`: health, current state, decisions waiting, and operator-facing summaries
 - `Usage`: usage, spend, subscription windows, and connector status
 - `Staff`: who is really working now versus only queued
-- `Collaboration`: parent-child relays and cross-session messages between existing agent sessions
+- `Collaboration`: a hall-first multi-agent work chat with live discussion, execution order, handoff, review, and evidence threads
 - `Tasks`: current work, approvals, execution chains, and runtime evidence
 - `Documents` and `Memory`: source-backed workbenches scoped to active OpenClaw agents
 
 ## What this release adds
-- `Collaboration`: a new standalone collaboration page so you can see both parent-child handoffs and verified cross-session agent communication such as `Main ⇄ Pandas`, instead of inferring everything from execution chains.
+- `Collaboration`: a new hall-first collaboration page so you can post work in one shared timeline, see real agent roster names reply live, and watch discussion collapse into one execution owner before review.
+- `Collaboration`: hall discussion, assign, and handoff can now dispatch through the real `openclaw agent` runtime, so the live draft stream reflects real session execution instead of only synthetic orchestrator text.
+- `Collaboration`: hall runtime streaming now prefers direct CLI/stdout passthrough when OpenClaw emits live output, and gracefully falls back to session-history deltas when the runtime only exposes persisted session updates.
+- `Collaboration`: `assign` can now trigger a short automatic real execution chain, so one owner can continue through several runtime turns before the task pauses in `review` or `blocked`.
+- `Collaboration`: the hall now uses your current OpenClaw roster directly; existing agent ids do not need to be renamed to any control-center-specific defaults before they can discuss, execute, and hand off work.
+- `Collaboration`: linked task rooms now act as detail and evidence threads with live room streaming, assignment, review, and optional outbound Discord or Telegram mirroring without moving source-of-truth storage out of `control-center`.
 - `Settings`: a new `Connection health` card that tells you what is already wired, what is still partial, and where to finish setup.
 - `Settings`: a new `Security risk summary` that translates current risk, impact, and next-step guidance into plain operator-facing language.
 - `Settings`: a new `Update status` card for current version, latest version, update channel, and install method.
@@ -65,10 +70,26 @@ Example UI from a local OpenClaw environment:
     </td>
   </tr>
   <tr>
-    <td><strong>Collaboration page</strong><br />See parent-child relays and verified cross-session communication such as <code>Main ⇄ Pandas</code> in one place.</td>
+    <td><strong>Collaboration page</strong><br />See one shared thread where agents discuss, assign owners, hand off work, and review results.</td>
     <td><strong>Security and update status</strong><br />See current risk, impact, next-step guidance, and the gap between your current and latest version.</td>
   </tr>
 </table>
+
+## Hall integration with your existing agents
+- The hall reads the current OpenClaw roster from the runtime environment and uses the live agent ids and display names it finds there.
+- Existing users do not need to rename agents to `pandas`, `coq`, `monkey`, or any other control-center-specific name before using hall collaboration.
+- Role suggestions are heuristic only. If the roster has clear names such as `manager`, `planner`, `builder`, or `qa`, the hall will use them; otherwise it falls back gracefully without blocking the workflow.
+- Hall runtime turns now carry structured transport context such as `surface`, `workspaceRoot`, `workdir`, `entryFiles`, and artifact references so repo-aware tasks can run against the same working context your agents already use elsewhere.
+
+## Hall workflow
+- Start with one task in the hall. The first turn stays in `discussion`.
+- Unless you explicitly `@` one agent, the hall aims to gather at least two short replies so the second person can add a missing angle instead of repeating the first.
+- Use `Arrange execution order` to decide the first owner, later owners, and what each person hands off.
+- Saving the order does **not** start execution.
+- Once the queue is ready, the decision card will show `Start execution (...)`.
+- During execution, each owner should finish only their own step, then visibly `@` the next owner in the same thread.
+- Review should happen only after the last queued owner finishes, or when a human explicitly asks to stop and review.
+- After review, use `Continue discussion` to reopen the thread, then arrange the next round and start again from the same thread.
 
 ## 5-minute start
 ```bash
@@ -77,6 +98,7 @@ cp .env.example .env
 npm run build
 npm test
 npm run smoke:ui
+npm run smoke:hall
 npm run dev:ui
 ```
 
@@ -103,12 +125,18 @@ Notes:
 ### Staff
 - Shows who is truly active now versus who only has queued work.
 - Separates live work from “next up” so backlog is not confused with active execution.
+- If a card shows `Role not defined in workspace`, start with the [FAQ & best practices guide](docs/FAQ.md).
 - Best when you want to know who is busy, idle, blocked, or waiting.
 
 ### Collaboration
-- Shows how work moves between agents: who accepted it first, who handed it off, and which session is holding the next move.
-- Covers both parent-child session relays and verified cross-session communication such as `sessions_send` / `inter-session message`.
-- Best when you want to understand “who passed this to whom, and where is the collaboration waiting now?”
+- Shows a shared multi-agent hall where operators post work once and the current roster replies in one timeline.
+- Streams draft agent replies live over SSE, then lands the final persisted message and any linked task-card state changes.
+- When hall runtime dispatch is enabled, discussion, assign, and handoff turns are sent through the real `openclaw agent` runtime and mirrored back from real session history.
+- When the runtime emits live stdout, the hall prefers that direct stream first; otherwise it keeps the draft alive with session-backed deltas so the operator still sees the real execution progress.
+- Assignment can trigger multiple real execution turns in sequence before pausing for review or surfacing a blocker, rather than stopping after a single runtime turn.
+- Keeps linked task rooms available as detail and evidence threads when you need deeper execution logs.
+- The intended interaction style is a real work chat: short discussion turns, one owner at a time during execution, explicit `@handoff`, then review only after the queued owners finish.
+- Best when you want to understand “who is talking now, who owns execution now, and what happens next?”
 
 ### Memory
 - A source-backed workbench for daily and long-term memory files.
@@ -155,7 +183,8 @@ Notes:
 4. `npm run build`
 5. `npm test`
 6. `npm run smoke:ui`
-7. `npm run dev:ui`
+7. `npm run smoke:hall`
+8. `npm run dev:ui`
 
 ## Installation and onboarding
 
@@ -246,9 +275,9 @@ Phase 1: inspect the environment
 8. Do not assume any fixed agent names. If `openclaw.json` is readable, treat it as the source of truth.
 
 Phase 2: install the project
-9. Confirm that the current directory is the control-center repo root.
+9. Confirm that the current directory is the control-center repo root. If it has not been cloned yet, clone it first: `git clone https://github.com/TianyiDataScience/openclaw-control-center.git`
 10. Verify the repo is complete before editing anything.
-11. If core paths are missing, stop and re-clone the official repo.
+11. If core paths (`src/runtime`, `src/ui`, `package.json`) are missing, do not continue. Re-clone from `https://github.com/TianyiDataScience/openclaw-control-center.git`.
 12. Run dependency install.
 13. If `.env` does not exist, create it from `.env.example`; otherwise correct it while preserving safe defaults.
 
@@ -269,6 +298,7 @@ Phase 4: validation
    - npm run build
    - npm test
    - npm run smoke:ui
+   - npm run smoke:hall
 18. If any step fails, stop and tell me exactly which step failed, why, and what I should fix next.
 19. If build / test / smoke succeed but the live Gateway is still unreachable, classify the result as: local UI works, but live observability is not fully connected yet.
 

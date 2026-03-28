@@ -1,0 +1,2003 @@
+import { setTimeout as delay } from "node:timers/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { ToolClient } from "../clients/tool-client";
+import {
+  HALL_RUNTIME_DIRECT_STREAM_ENABLED,
+  HALL_RUNTIME_DISPATCH_ENABLED,
+  HALL_RUNTIME_HISTORY_LIMIT,
+  HALL_RUNTIME_POLL_INTERVAL_MS,
+  HALL_RUNTIME_THINKING_LEVEL,
+  HALL_RUNTIME_TIMEOUT_SECONDS,
+} from "../config";
+import type { AgentRunRequest, AgentRunTransportContext } from "../contracts/openclaw-tools";
+import type {
+  CollaborationHall,
+  HallMessage,
+  HallParticipant,
+  HallSemanticRole,
+  HallTaskCard,
+  ProjectTask,
+  StructuredHandoffPacket,
+  TaskArtifact,
+} from "../types";
+import {
+  isHallDraftCanceled,
+  beginHallDraftReply,
+  completeHallDraftReply,
+  pushHallDraftDelta,
+} from "./collaboration-stream";
+import { inferHallDiscussionDomainFromText } from "./hall-discussion-domain";
+import { readSessionConversationHistory, type SessionHistoryMessage } from "./session-conversations";
+
+interface ToolClientWithAgentRun extends ToolClient {
+  agentRun?(request: AgentRunRequest): Promise<{
+    ok: boolean;
+    text: string;
+    rawText: string;
+    sessionKey?: string;
+    sessionId?: string;
+  }>;
+  agentRunStream?(
+    request: AgentRunRequest,
+    handlers?: {
+      onStdoutChunk?: (chunk: string) => void;
+      onStderrChunk?: (chunk: string) => void;
+    },
+  ): Promise<{
+    ok: boolean;
+    text: string;
+    rawText: string;
+    sessionKey?: string;
+    sessionId?: string;
+  }>;
+}
+
+export type HallRuntimeNextAction = "continue" | "review" | "blocked" | "handoff" | "done";
+
+export interface HallRuntimeChainDirective {
+  nextAction?: HallRuntimeNextAction;
+  nextStep?: string;
+  executor?: string;
+}
+
+export interface HallRuntimeDispatchInput {
+  client: ToolClient;
+  hall: CollaborationHall;
+  taskCard: HallTaskCard;
+  participant: HallParticipant;
+  task?: ProjectTask;
+  triggerMessage?: HallMessage;
+  recentThreadMessages?: HallMessage[];
+  mode: "discussion" | "execution" | "handoff";
+  handoff?: StructuredHandoffPacket;
+  note?: string;
+}
+
+export interface HallRuntimeDispatchResult {
+  kind: HallMessage["kind"];
+  content: string;
+  canceled?: boolean;
+  suppressVisibleMessage?: boolean;
+  payload?: HallMessage["payload"];
+  sessionKey?: string;
+  sessionId?: string;
+  chainDirective?: HallRuntimeChainDirective;
+  taskCardPatch?: {
+    proposal?: string;
+    decision?: string;
+    doneWhen?: string;
+    currentOwnerParticipantId?: string;
+    currentOwnerLabel?: string;
+    blockers?: string[];
+    requiresInputFrom?: string[];
+    latestSummary?: string;
+  };
+}
+
+interface ConcreteDeliverableEnforcement {
+  content: string;
+  nextAction?: HallRuntimeNextAction;
+  suppressVisibleMessage?: boolean;
+  nextStep?: string;
+}
+
+type HallOperatorIntentType =
+  | "discussion_request"
+  | "direct_deliverable_request"
+  | "repo_scan_request"
+  | "review_request"
+  | "planning_request"
+  | "control_request";
+
+interface HallOperatorIntent {
+  type: HallOperatorIntentType;
+  text: string;
+  explicitTarget: boolean;
+}
+
+type ConcreteDeliverableKind =
+  | "repo_scan"
+  | "review"
+  | "thumbnail_urls"
+  | "thumbnail_ideas"
+  | "spoken_openings"
+  | "hooks"
+  | "script"
+  | "generic";
+
+interface ParsedStructuredBlock {
+  proposal?: string;
+  decision?: string;
+  executor?: string;
+  doneWhen?: string;
+  blockers?: string[];
+  requiresInputFrom?: string[];
+  latestSummary?: string;
+  nextAction?: HallRuntimeNextAction;
+  nextStep?: string;
+  artifactRefs?: TaskArtifact[];
+}
+
+interface HallRuntimeRepoContext {
+  lines: string[];
+  entryFiles: string[];
+}
+
+type HallResponseLanguage = "zh" | "en";
+
+const CONTROL_CENTER_REPO_ROOT = process.cwd();
+const AGENT_WORKSPACES_ROOT = join(CONTROL_CENTER_REPO_ROOT, "..", "..");
+const CONTROL_CENTER_REPO_ENTRY_FILES = [
+  "src/ui/collaboration-hall.ts",
+  "src/ui/collaboration-hall-theme.ts",
+  "src/ui/server.ts",
+  "src/runtime/collaboration-hall-orchestrator.ts",
+  "src/runtime/hall-runtime-dispatch.ts",
+  "src/types.ts",
+];
+const HALL_REPO_CONTEXT_MAX_FILE_CHARS = 1_600;
+const HALL_REPO_CONTEXT_MAX_TOTAL_CHARS = 7_200;
+const HALL_WORKSPACE_PERSONA_FILES = ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md", "README.md"];
+const HALL_WORKSPACE_PERSONA_CACHE = new Map<string, string>();
+
+export function canDispatchHallToRuntime(client: ToolClient | undefined, participant: HallParticipant): client is ToolClientWithAgentRun {
+  return Boolean(
+    HALL_RUNTIME_DISPATCH_ENABLED &&
+      client &&
+      participant.active &&
+      (participant.agentId ?? participant.participantId).trim() &&
+      (typeof client.agentRun === "function" || typeof client.agentRunStream === "function"),
+  );
+}
+
+export async function dispatchHallRuntimeTurn(input: HallRuntimeDispatchInput): Promise<HallRuntimeDispatchResult> {
+  const participantAgentId = (input.participant.agentId ?? input.participant.participantId).trim();
+  if (!canDispatchHallToRuntime(input.client, input.participant)) {
+    throw new Error(`Runtime dispatch is unavailable for participant '${input.participant.displayName}'.`);
+  }
+
+  const expectedSessionKey = pickExpectedSessionKey(input.taskCard, participantAgentId);
+  const baselineHistory = expectedSessionKey
+    ? await safeReadHistory(input.client, expectedSessionKey)
+    : [];
+  const baselineFingerprint = baselineHistory.at(-1) ? fingerprintHistoryMessage(baselineHistory.at(-1)!) : undefined;
+  const repoContext = buildHallRuntimeRepoContext(input);
+  const prompt = buildHallRuntimePrompt(input, repoContext);
+  const draftId = beginHallDraftReply({
+    hallId: input.hall.hallId,
+    taskCardId: input.taskCard.taskCardId,
+    projectId: input.taskCard.projectId,
+    taskId: input.taskCard.taskId,
+    roomId: input.taskCard.roomId,
+    authorParticipantId: input.participant.participantId,
+    authorLabel: input.participant.displayName,
+    authorSemanticRole: input.participant.semanticRole,
+    messageKind: resolveHallRuntimeMessageKind(input),
+    content: "",
+  });
+
+  let currentSessionKey = expectedSessionKey;
+  let lastStreamedText = "";
+  let lastHistoryDraftText = "";
+  let sessionHistoryObserved = false;
+  let directStdoutBuffer = "";
+  let finished = false;
+
+  const applyDraftText = (nextDraftText: string, source: "session" | "stdout"): void => {
+    const normalized = nextDraftText.trim();
+    if (!normalized) return;
+    if (normalized.length <= lastStreamedText.length) return;
+    if (lastStreamedText && !normalized.startsWith(lastStreamedText)) {
+      if (source === "stdout" && !sessionHistoryObserved) {
+        lastStreamedText = "";
+      } else {
+        return;
+      }
+    }
+    const delta = normalized.slice(lastStreamedText.length);
+    if (!delta) return;
+    lastStreamedText = normalized;
+    pushHallDraftDelta({
+      hallId: input.hall.hallId,
+      taskCardId: input.taskCard.taskCardId,
+      projectId: input.taskCard.projectId,
+      taskId: input.taskCard.taskId,
+      roomId: input.taskCard.roomId,
+      draftId,
+      authorParticipantId: input.participant.participantId,
+      authorLabel: input.participant.displayName,
+      authorSemanticRole: input.participant.semanticRole,
+      messageKind: resolveHallRuntimeMessageKind(input),
+      delta,
+    });
+  };
+
+  const flushHistory = async (sessionKey: string | undefined): Promise<void> => {
+    if (!sessionKey) return;
+    const history = await safeReadHistory(input.client, sessionKey);
+    const nextDraftText = renderRuntimeDraftText(history, baselineFingerprint);
+    if (!nextDraftText) return;
+    lastHistoryDraftText = nextDraftText;
+    sessionHistoryObserved = true;
+    applyDraftText(nextDraftText, "session");
+  };
+
+  const poller = (async () => {
+    while (!finished) {
+      try {
+        await flushHistory(currentSessionKey);
+      } catch {
+        // Best-effort only; final completion still comes from agentRun().
+      }
+      await delay(HALL_RUNTIME_POLL_INTERVAL_MS);
+    }
+  })();
+
+  try {
+    const request: AgentRunRequest = {
+      agentId: participantAgentId,
+      sessionKey: expectedSessionKey,
+      message: prompt,
+      thinking: HALL_RUNTIME_THINKING_LEVEL,
+      timeoutSeconds: HALL_RUNTIME_TIMEOUT_SECONDS,
+      context: buildHallRuntimeTransportContext(input, repoContext.entryFiles),
+    };
+    const response = input.client.agentRunStream && HALL_RUNTIME_DIRECT_STREAM_ENABLED
+      ? await input.client.agentRunStream(request, {
+          onStdoutChunk: (chunk) => {
+            directStdoutBuffer += chunk;
+            if (sessionHistoryObserved) return;
+            const directText = sanitizeDirectRuntimeOutput(directStdoutBuffer);
+            if (!directText) return;
+            applyDraftText(directText, "stdout");
+          },
+        })
+      : input.client.agentRun
+        ? await input.client.agentRun(request)
+        : await Promise.reject(new Error("No runtime dispatch method is available."));
+    currentSessionKey = response.sessionKey?.trim() || expectedSessionKey;
+    await flushHistory(currentSessionKey);
+    const parsed = extractStructuredBlock(response.text);
+    const visibleContent = sanitizeHallVisibleRuntimeText(lastHistoryDraftText)
+      || sanitizeHallVisibleRuntimeText(parsed.visibleText)
+      || buildFallbackVisibleContent(input, response.text);
+    const structured = parsed.structured;
+    const result = buildHallRuntimeResult({
+      input,
+      content: visibleContent,
+      structured,
+      sessionKey: currentSessionKey,
+      sessionId: response.sessionId?.trim() || undefined,
+    });
+    if (isHallDraftCanceled(draftId)) {
+      return {
+        ...result,
+        canceled: true,
+      };
+    }
+    completeHallDraftReply({
+      hallId: input.hall.hallId,
+      taskCardId: input.taskCard.taskCardId,
+      projectId: input.taskCard.projectId,
+      taskId: input.taskCard.taskId,
+      roomId: input.taskCard.roomId,
+      draftId,
+      content: result.content,
+    });
+    return result;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unknown runtime error";
+    const failureText = `Runtime dispatch failed: ${detail}`;
+    if (isHallDraftCanceled(draftId)) {
+      throw error;
+    }
+    if (failureText.length > lastStreamedText.length) {
+      pushHallDraftDelta({
+        hallId: input.hall.hallId,
+        taskCardId: input.taskCard.taskCardId,
+        projectId: input.taskCard.projectId,
+        taskId: input.taskCard.taskId,
+        roomId: input.taskCard.roomId,
+        draftId,
+        authorParticipantId: input.participant.participantId,
+        authorLabel: input.participant.displayName,
+        authorSemanticRole: input.participant.semanticRole,
+        messageKind: resolveHallRuntimeMessageKind(input),
+        delta: failureText.slice(lastStreamedText.length),
+      });
+    }
+    completeHallDraftReply({
+      hallId: input.hall.hallId,
+      taskCardId: input.taskCard.taskCardId,
+      projectId: input.taskCard.projectId,
+      taskId: input.taskCard.taskId,
+      roomId: input.taskCard.roomId,
+      draftId,
+      content: failureText,
+    });
+    throw error;
+  } finally {
+    finished = true;
+    await poller.catch(() => undefined);
+  }
+}
+
+function buildHallRuntimePrompt(input: HallRuntimeDispatchInput, repoContext: HallRuntimeRepoContext): string {
+  const responseLanguage = inferHallResponseLanguage(
+    input.triggerMessage?.content
+      ?? `${input.taskCard.title}\n${input.taskCard.description}\n${input.task?.title ?? ""}`,
+  );
+  const responseLanguageInstruction = responseLanguage === "zh"
+    ? "Reply in Simplified Chinese unless the latest human message explicitly asks for another language."
+    : "Reply in English unless the latest human message explicitly asks for another language.";
+  const recentMessages = dedupeHallPromptMessages(
+    [...(input.recentThreadMessages ?? []), ...(input.triggerMessage ? [input.triggerMessage] : [])],
+  ).slice(-10);
+  const transcriptBlock = recentMessages.length > 0
+    ? [
+        "Recent shared thread transcript (oldest -> newest):",
+        ...recentMessages.map((message) => `- ${message.authorLabel}${message.authorSemanticRole ? ` [${message.authorSemanticRole}]` : ""}: ${message.content}`),
+      ].join("\n")
+    : "";
+  const role = input.participant.semanticRole;
+  const roleFocus = describeDiscussionRoleFocus(role, `${input.taskCard.title}\n${input.taskCard.description}`);
+  const currentExecutionItem = resolveCurrentExecutionItem(input.taskCard, input.participant.participantId);
+  const nextParticipantId = currentExecutionItem?.handoffToParticipantId?.trim()
+    || input.taskCard.plannedExecutionOrder[0]
+    || "";
+  const nextParticipant = nextParticipantId
+    ? input.hall.participants.find((participant) => participant.participantId === nextParticipantId)
+    : undefined;
+  const nextExecutionItem = nextParticipantId
+    ? resolvePlannedExecutionItem(input.taskCard, nextParticipantId)
+    : undefined;
+  const repoContextLines = repoContext.lines;
+  const roundRosterBlock = buildHallRuntimeRosterBlock(input);
+  const selfWorkspacePersona = describeHallParticipantWorkspacePersona(input.participant);
+  const taskArtifactBlock = buildHallRuntimeArtifactBlock(input.task?.artifacts, responseLanguage, "task");
+  const handoffArtifactBlock = buildHallRuntimeArtifactBlock(input.handoff?.artifactRefs, responseLanguage, "handoff");
+  const operatorIntent = resolveHallOperatorIntent(input);
+  const directResponseIntent = isDirectResponseIntent(operatorIntent) ? operatorIntent : undefined;
+  const discussionTurnCount = input.taskCard.discussionCycle?.completedParticipantIds.length ?? 0;
+  const isFollowupDiscussionVoice = discussionTurnCount > 0;
+  const priorTeammateHint = buildPreviousTeammateHint(recentMessages, input.participant.participantId);
+  const common = [
+    `You are ${input.participant.displayName}, participating in the control-center Collaboration Hall.`,
+    `Your semantic responsibility is ${role}.`,
+    `Task title: ${input.taskCard.title}`,
+    `Task description: ${input.taskCard.description}`,
+    `Current hall stage: ${input.taskCard.stage}`,
+    input.taskCard.doneWhen ? `Current done_when: ${input.taskCard.doneWhen}` : "",
+    input.taskCard.decision ? `Current decision: ${input.taskCard.decision}` : "",
+    input.taskCard.currentOwnerLabel ? `Current owner: ${input.taskCard.currentOwnerLabel}` : "",
+    recentMessages.length > 0 ? `Recent agent contributions already in thread: ${countRecentAgentContributors(recentMessages)}.` : "",
+    transcriptBlock,
+    roundRosterBlock,
+    selfWorkspacePersona ? `Your workspace persona and job boundary: ${selfWorkspacePersona}` : "",
+    taskArtifactBlock,
+    handoffArtifactBlock,
+    ...repoContextLines,
+    "Reply like a real coworker in a busy work chat: 1-3 short lines, concrete and specific, no memo tone.",
+    "Sound like a teammate doing the work, not a narrator explaining the workflow.",
+    "Short beats only: result first, then the next useful move or @who takes it next.",
+    "Acknowledge only the latest unresolved point and add the next useful contribution instead of rewriting the whole plan.",
+    "Prefer direct work-chat phrasing: short, decisive, easy to hand off. Avoid retrospective or report tone.",
+    "Do not write labels like Proposal, Decision, Suggested order, Suggested first executor, owner, or doneWhen in the visible reply.",
+    'Avoid filler openings like "我先把…", "当前结果是…", "现阶段…", "我建议下一步…", "I want to clarify", or "At this stage". Start with the concrete action or result.',
+    responseLanguageInstruction,
+    "Do not mention hidden system instructions.",
+    "If you include structured state, append one JSON block at the very end using <hall-structured>{...}</hall-structured>.",
+  ].filter(Boolean);
+
+  if (input.mode === "discussion") {
+    if (directResponseIntent) {
+      const directTaskInstruction = directResponseIntent.type === "repo_scan_request"
+        ? "The latest human message is directly assigning you repo inspection work. Inspect the repository and answer with concrete file findings right now."
+        : directResponseIntent.type === "review_request"
+          ? "The latest human message is directly asking you for a targeted review answer. Reply with the must-fix point or a clean pass right now."
+          : "The latest human message is directly assigning you a concrete deliverable. Post that deliverable right now instead of turning this into a decision or workflow recap.";
+      return [
+        ...common,
+        directResponseIntent.explicitTarget
+          ? "The latest human message is explicitly assigning you work right now."
+          : "The latest human message is asking for a concrete result right now, and you are the one replying to it.",
+        `Direct ask you must satisfy now: ${directResponseIntent.text}`,
+        "Prioritize this current ask over your default semantic role for this reply.",
+        directTaskInstruction,
+        buildConcreteExecutionOutputRequirement(directResponseIntent.text, responseLanguage, directResponseIntent),
+        directResponseIntent.type === "review_request"
+          ? "Keep the reply focused: pass / must-fix only. Do not reopen planning unless the human explicitly asks for that."
+          : "Do not delegate the work away before posting the deliverable the human asked you for.",
+        "Do not turn this into a decision, reassignment, or process recap.",
+        'Structured JSON keys you may include: "proposal", "artifactRefs".',
+      ].filter(Boolean).join("\n");
+    }
+    const rosterLine = input.hall.participants.length > 0
+      ? `Only refer to real hall participants by these exact names when you recommend an executor: ${input.hall.participants.map((participant) => participant.displayName).join(", ")}.`
+      : "";
+    return [
+      ...common,
+      "This is discussion only. Do not start execution yet.",
+      "Do not act like a greeter and do not ask to create a task card; the hall already has enough context to discuss the work.",
+      rosterLine,
+      role === "manager"
+        ? "You are landing the thread on a practical next step. Give one short decision, name exactly one first executor by real agent name, and define doneWhen. Do not recap the whole thread."
+        : roleFocus,
+      explicitHallMentionTargetLine(input),
+      isFollowupDiscussionVoice
+        ? "Another teammate already spoke in this round. Start by building directly on that point, then add only one new angle, correction, or missing constraint."
+        : "You are the first responder in this round. Open with one concrete angle and leave space for the next teammate to add a different one.",
+      priorTeammateHint,
+      role !== "manager"
+        ? "Add one distinct missing perspective instead of repeating the previous speaker or rewriting the whole plan. One useful angle is enough."
+        : "Write like a teammate in chat who is wrapping things up. One short decision, one explicit first owner, one done-when is enough.",
+      role !== "manager"
+        ? "Do not nominate, @mention, or route the next executor yet. Leave explicit owner-picking and handoff language to the manager unless the human explicitly asked about a named teammate."
+        : "",
+      role !== "manager"
+        ? "Assume at least one teammate will speak after you unless the human explicitly @mentions only one person. Do not try to answer everything yourself."
+        : "",
+      role !== "manager"
+        ? "If you are not the manager, do not assign work with an @mention unless the human explicitly asked for that teammate."
+        : "",
+      isFollowupDiscussionVoice
+        ? "Do not restart the thread from scratch. No long recap. Make the previous speaker's point stronger or sharper in one move, and do not reuse their opening sentence or summary."
+        : "Do not dump a full plan. Your job is to open one good angle, not to say everything at once.",
+      isFollowupDiscussionVoice
+        ? "React to the teammate's point directly, then add one missing delta. Avoid canned openers or speech-style framing."
+        : "Start with the concrete point itself. Avoid canned openers, scene-setting, or speech-style framing.",
+      "Do not explain the whole product or workflow unless that exact explanation is the missing angle.",
+      "One useful push is enough: a sharper criterion, a must-fix risk, or a clearer next move.",
+      'Structured JSON keys you may include: "proposal", "decision", "executor", "doneWhen", "artifactRefs".',
+    ].join("\n");
+  }
+
+  if (input.mode === "handoff" && input.handoff) {
+    return [
+      ...common,
+      "You are receiving a structured handoff and should continue the real work now.",
+      `Handoff goal: ${input.handoff.goal}`,
+      `Current result: ${input.handoff.currentResult}`,
+      `Done when: ${input.handoff.doneWhen}`,
+      input.handoff.blockers.length > 0 ? `Blockers: ${input.handoff.blockers.join("; ")}` : "",
+      input.handoff.requiresInputFrom.length > 0
+        ? `Requires input from: ${input.handoff.requiresInputFrom.join(", ")}`
+        : "",
+      nextParticipant
+        ? `The next queued owner after you is ${nextParticipant.displayName}. If you finish your step without a real blocker, hand the work to ${nextParticipant.displayName} instead of stopping at a vague review note.`
+        : "There is no further queued owner after you. If you finish your step without a real blocker, move the work to review.",
+      nextExecutionItem?.task
+        ? `Your exact planned execution item is: ${nextExecutionItem.task}`
+        : "",
+      "Use your real tools if needed. Then reply like a coworker in chat, not like a memo.",
+      "Keep it brief unless the deliverable itself is a list, URLs, or concrete repo/file findings. In those cases, post the full deliverable instead of summarizing it away.",
+      "For repo/code-scan work, inspect the repo before replying and cite real file paths plus what each file proves.",
+      buildConcreteExecutionOutputRequirement(nextExecutionItem?.task ?? input.handoff.goal, responseLanguage),
+      "Prefer this shape: what changed, and @who acts next.",
+      "If it is ready for review, say it like a teammate: '现在请老板评审。' / 'Ready for review.' Do not say '推进到 review' or other system phrasing.",
+      "No numbered list unless the deliverable itself is literally a list.",
+      'Good example: "这版先收住了，owner 还不够显眼。@下一位 你把最后一拍改成可执行句。" ',
+      "If there is a next owner and no blocker, explicitly @ that owner in the visible reply.",
+    nextExecutionItem?.task
+      ? `If you hand off, keep your visible @handoff aligned with the planned next task for ${nextParticipant?.displayName ?? "the next owner"}: ${nextExecutionItem.task}`
+      : "",
+      "Do not say the work is ready, done, or ready for review until the visible reply already contains the concrete deliverable for your step.",
+      "Do not restate the whole thread. Do not write a retrospective. Do not reopen earlier owners unless there is a real blocker.",
+      'Structured JSON keys you may include: "latestSummary", "blockers", "requiresInputFrom", "doneWhen", "nextAction", "nextStep", "artifactRefs".',
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    ...common,
+    "You are the current execution owner. Do the real work now if needed, then post a concise worker update for the hall.",
+    currentExecutionItem?.task ? `Your current execution item: ${currentExecutionItem.task}` : "",
+    currentExecutionItem?.handoffWhen ? `Your step is done when: ${currentExecutionItem.handoffWhen}` : "",
+    nextParticipant
+      ? `The next queued owner after you is ${nextParticipant.displayName}. When your current execution item is complete, hand the work off to ${nextParticipant.displayName} instead of doing their step yourself.`
+      : "If your current execution item is complete and there is no next owner, move the work to review instead of inventing extra steps.",
+    nextExecutionItem?.task ? `The next owner's step after you is: ${nextExecutionItem.task}` : "",
+    input.note ? `Assignment note: ${input.note}` : "",
+    "Stay inside the current execution item only. Do not complete deliverables that belong to later owners in the execution order.",
+    "Write like a coworker in a work chat.",
+    "Keep it brief unless the deliverable itself is a list, URLs, or concrete repo/file findings. In those cases, post the full deliverable instead of compressing it into two lines.",
+    "Say only what concrete result now exists, any real blocker, and @who acts next.",
+    "If your current execution item asks for a concrete deliverable, the visible reply must contain that deliverable itself: the actual hooks, thumbnail ideas, URLs, script lines, file findings, or repo evidence. Do not just comment on what should be done.",
+    "For code-scan / repo-summary work, inspect the repo before replying. The visible reply must cite real file paths and what you found in them.",
+    buildConcreteExecutionOutputRequirement(currentExecutionItem?.task, responseLanguage),
+    "If your step is done and there is a next owner, make the visible reply read like a handoff between coworkers, not a status report.",
+    "No numbered list unless the deliverable itself is literally a list.",
+    'Good example: "第一版脚本先锁住了，核心句是‘不是在聊天，是在推进任务’。@下一位 你只挑必须改的一点。" ',
+    "If there is a next queued owner and you are not blocked, explicitly @ that owner in the visible reply.",
+    nextExecutionItem?.task
+      ? `If you hand off, do not invent a different next task. Keep your visible @handoff aligned with the planned next task for ${nextParticipant?.displayName ?? "the next owner"}: ${nextExecutionItem.task}`
+      : "",
+    "Do not say the work is done, hand off, or ask for review until the visible reply already contains the concrete deliverable for your step.",
+    "Do not write a project recap, status memo, or generic brainstorming. If there is a next queued owner and you are not blocked, hand off instead of lingering on your own step.",
+    'Structured JSON keys you may include: "latestSummary", "blockers", "requiresInputFrom", "doneWhen", "nextAction", "nextStep", "artifactRefs".',
+    'Allowed nextAction values: "continue" when you need one more pass on your current execution item, "handoff" when your current execution item is complete and the next queued owner should take over, "review" when the work is ready for review and there is no further handoff, and "blocked" when you need help before continuing.',
+  ].filter(Boolean).join("\n");
+}
+
+function buildHallRuntimeArtifactBlock(
+  artifacts: TaskArtifact[] | undefined,
+  language: HallResponseLanguage,
+  source: "task" | "handoff",
+): string {
+  if (!artifacts || artifacts.length === 0) return "";
+  const preview = artifacts
+    .slice(0, 6)
+    .map((artifact) => `${artifact.label} (${artifact.location})`)
+    .join(language === "zh" ? "；" : "; ");
+  if (language === "zh") {
+    return source === "handoff"
+      ? `上一棒已经留下这些产物，继续做时优先沿用它们：${preview}`
+      : `当前线程已经关联这些产物，能复用就直接复用：${preview}`;
+  }
+  return source === "handoff"
+    ? `The previous owner already left these artifacts behind. Start from them if they help: ${preview}`
+    : `This thread already has these artifacts attached. Reuse them when they are relevant: ${preview}`;
+}
+
+function resolveHallOperatorIntent(
+  input: HallRuntimeDispatchInput,
+): HallOperatorIntent | undefined {
+  const triggerMessage = input.triggerMessage;
+  if (!triggerMessage || triggerMessage.authorParticipantId !== "operator") return undefined;
+  const rawContent = String(triggerMessage.content || "").trim();
+  if (!rawContent) return undefined;
+  const normalized = sanitizeHallVisibleRuntimeText(rawContent)
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return undefined;
+
+  const explicitTarget = isExplicitHallTaskTarget(triggerMessage, input.participant);
+  let type = classifyHallOperatorIntent(normalized);
+  if (
+    input.mode === "discussion"
+    && !explicitTarget
+    && (
+      type === "direct_deliverable_request"
+      || type === "repo_scan_request"
+      || type === "review_request"
+    )
+  ) {
+    type = "discussion_request";
+  }
+
+  return {
+    type,
+    text: normalized,
+    explicitTarget,
+  };
+}
+
+function classifyHallOperatorIntent(text: string): HallOperatorIntentType {
+  if (/(开始执行|继续讨论|安排后续顺序|调整执行顺序|保存顺序|stop|停止|暂停|恢复|resume|start execution)/i.test(text)) {
+    return "control_request";
+  }
+  if (/(收一下|收个口|给个结论|拍板|定一下|做决定|作决定|第一执行者|建议第一位执行者|先给.*第一步|给.*第一步|谁先做|谁来做第一步|谁来先做|执行顺序|下一步由谁|谁负责)/i.test(text)) {
+    return "planning_request";
+  }
+  if (/(repo|repository|codebase|source code|scan code|scan the repo|implementation|file path|workspace|代码|源码|仓库|扫描代码|扫代码|实现|文件)/i.test(text)) {
+    return "repo_scan_request";
+  }
+  if (/(must-fix|review|审核|评审|检查|挑一下|挑出|只挑|硬问题|硬缺口)/i.test(text)) {
+    return "review_request";
+  }
+  if (/(给我|给一下|直接给|你给|你来|你去|请你|帮我|直接出|出一下|写一下|写一版|给一版|直接贴|贴一下|去扫|扫一下|看一下|查一下|产出|生成|整理|总结|扫描|scan|inspect|check|review|write|draft|produce|generate|show me|give me|please give|please write|please scan|can you|could you|完整的?.*(开头|口播|脚本|文案|版本)|三个?.*(开头|视频开头|口播开头)|3 个.*(开头|视频开头|口播开头|hook|thumbnail))/i.test(text)) {
+    return "direct_deliverable_request";
+  }
+  return "discussion_request";
+}
+
+function isDirectResponseIntent(intent: HallOperatorIntent | undefined): intent is HallOperatorIntent {
+  return Boolean(intent && (
+    intent.type === "direct_deliverable_request"
+    || intent.type === "repo_scan_request"
+    || intent.type === "review_request"
+  ));
+}
+
+function isExplicitHallTaskTarget(message: HallMessage, participant: HallParticipant): boolean {
+  const mentionTargets = message.mentionTargets?.map((target) => String(target.participantId || "").trim()) ?? [];
+  if (mentionTargets.includes(participant.participantId)) return true;
+
+  const content = String(message.content || "");
+  const candidates = [
+    participant.participantId,
+    participant.displayName,
+    ...(Array.isArray(participant.aliases) ? participant.aliases : []),
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return candidates.some((candidate) => {
+    const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(^|[\\s([{（，。！？、,.!?;:：])@${escaped}(?=$|[\\s)\\]}）,.!?;:：，。！？、])`, "i").test(content);
+  });
+}
+
+function buildHallRuntimeRepoContext(input: HallRuntimeDispatchInput): HallRuntimeRepoContext {
+  const operatorIntent = resolveHallOperatorIntent(input);
+  if (input.mode === "discussion" && operatorIntent && operatorIntent.type !== "repo_scan_request") {
+    return { lines: [], entryFiles: [] };
+  }
+  const shouldInclude = input.mode !== "discussion" || looksLikeRepoAwareTask(input);
+  if (!shouldInclude) return { lines: [], entryFiles: [] };
+  const existingEntryFiles = CONTROL_CENTER_REPO_ENTRY_FILES
+    .filter((relativePath) => existsSync(join(CONTROL_CENTER_REPO_ROOT, relativePath)));
+  const fileEvidence = buildHallRuntimeRepoEvidence(existingEntryFiles);
+  return {
+    entryFiles: existingEntryFiles,
+    lines: [
+      `Repository root for this running control-center instance: ${CONTROL_CENTER_REPO_ROOT}`,
+      existingEntryFiles.length > 0
+        ? `If you need to inspect implementation details, start with these existing files: ${existingEntryFiles.join(", ")}`
+        : "",
+      "Treat this as a normal workspace agent turn. If your agent runtime normally has file-reading tools, they are still available here; do not claim the hall surface blocks repo inspection by default.",
+      "If the current execution item asks for a code scan, implementation summary, or repo-based conclusion, inspect this repository before claiming the repo context is missing.",
+      fileEvidence.length > 0
+        ? ["Literal repository excerpts for grounding:", ...fileEvidence].join("\n")
+        : "",
+    ].filter(Boolean),
+  };
+}
+
+function buildHallRuntimeTransportContext(
+  input: HallRuntimeDispatchInput,
+  entryFiles: string[],
+): AgentRunTransportContext {
+  return {
+    surface: "control-center/hall",
+    workspaceRoot: CONTROL_CENTER_REPO_ROOT,
+    workdir: CONTROL_CENTER_REPO_ROOT,
+    entryFiles,
+    artifactRefs: input.task?.artifacts.map((artifact) => ({
+      artifactId: artifact.artifactId,
+      type: artifact.type,
+      label: artifact.label,
+      location: artifact.location,
+    })) ?? [],
+  };
+}
+
+function buildHallRuntimeRepoEvidence(existingEntryFiles: string[]): string[] {
+  const excerpts: string[] = [];
+  let remainingChars = HALL_REPO_CONTEXT_MAX_TOTAL_CHARS;
+  for (const relativePath of existingEntryFiles) {
+    if (remainingChars <= 0) break;
+    const snippet = readHallRuntimeRepoSnippet(relativePath, Math.min(HALL_REPO_CONTEXT_MAX_FILE_CHARS, remainingChars));
+    if (!snippet) continue;
+    excerpts.push(`--- ${relativePath} ---\n${snippet}`);
+    remainingChars -= snippet.length;
+  }
+  return excerpts;
+}
+
+function readHallRuntimeRepoSnippet(relativePath: string, maxChars: number): string {
+  try {
+    const absolutePath = join(CONTROL_CENTER_REPO_ROOT, relativePath);
+    const raw = readFileSync(absolutePath, "utf8").trim();
+    if (!raw) return "";
+    const normalized = raw.replace(/\r\n/g, "\n");
+    if (normalized.length <= maxChars) return normalized;
+    return `${normalized.slice(0, Math.max(0, maxChars - 16)).trimEnd()}\n/* truncated */`;
+  } catch {
+    return "";
+  }
+}
+
+function looksLikeRepoAwareTask(input: HallRuntimeDispatchInput): boolean {
+  const source = [
+    input.taskCard.title,
+    input.taskCard.description,
+    input.task?.title ?? "",
+    input.note ?? "",
+    input.handoff?.goal ?? "",
+    input.handoff?.currentResult ?? "",
+    input.triggerMessage?.content ?? "",
+    resolveCurrentExecutionItem(input.taskCard, input.participant.participantId)?.task ?? "",
+  ].join("\n");
+  return /(repo|repository|codebase|source code|scan code|scan the repo|implementation|file path|workspace|代码|源码|仓库|扫描代码|扫代码|实现|文件)/i.test(source);
+}
+
+function resolveCurrentExecutionItem(
+  taskCard: HallTaskCard,
+  participantId: string,
+): HallTaskCard["currentExecutionItem"] | undefined {
+  const current = taskCard.currentExecutionItem;
+  if (current?.participantId === participantId) return current;
+  return taskCard.plannedExecutionItems.find((item) => item.participantId === participantId);
+}
+
+function resolvePlannedExecutionItem(
+  taskCard: HallTaskCard,
+  participantId: string,
+): HallTaskCard["plannedExecutionItems"][number] | HallTaskCard["currentExecutionItem"] | undefined {
+  const current = taskCard.currentExecutionItem;
+  if (current?.participantId === participantId) return current;
+  return taskCard.plannedExecutionItems.find((item) => item.participantId === participantId);
+}
+
+function describeDiscussionRoleFocus(role: HallParticipant["semanticRole"], source: string): string {
+  const normalized = source.toLowerCase();
+  const creative = /(动画|动效|可视化|visual|animation|storyboard|脚本|海报|品牌|创意|设计稿|style frame)/i.test(normalized);
+  const analysis = /(数据|图表|dashboard|指标|分析|insight|metric|analytics|可视化)/i.test(normalized);
+  const research = /(调研|research|benchmark|study|compare|调查|访谈|洞察|评估)/i.test(normalized);
+  const product = /(产品|发布|roadmap|增长|用户|功能|体验|launch|go[- ]to[- ]market|workflow|feature)/i.test(normalized);
+  const operations = /(运营|流程|排期|runbook|support|审批|交接|上线|通知|治理)/i.test(normalized);
+
+  if (role === "planner") {
+    if (creative) return "Focus on clarifying the brief: audience, message, style boundary, output format, and what the first reviewable creative artifact should be.";
+    if (analysis) return "Focus on clarifying the question, audience, data scope, output artifact, and what decision the result should support.";
+    if (research) return "Focus on clarifying the research question, evidence standard, and what kind of conclusion will be useful.";
+    if (product) return "Focus on clarifying the user problem, success criteria, constraints, and the smallest meaningful first slice.";
+    if (operations) return "Focus on clarifying the workflow, stakeholders, approvals, and handoff boundaries before execution starts.";
+    return "Focus on clarifying the outcome, audience, constraints, and what done should mean before execution starts.";
+  }
+  if (role === "coder") {
+    if (creative) return "Act as the practical implementer. Propose a concrete execution path such as storyboard -> sample -> iteration, even though this is not a coding-only task.";
+    if (analysis) return "Act as the practical implementer. Propose a concrete path to turn the idea into a reviewable prototype or artifact.";
+    if (research) return "Act as the practical implementer. Propose a concrete path to collect evidence, synthesize it, and return a usable recommendation.";
+    if (product) return "Act as the practical implementer. Propose the first tangible draft, prototype, or plan that can validate the direction.";
+    if (operations) return "Act as the practical implementer. Propose the first controlled workflow slice that can be executed and observed.";
+    return "Act as the practical implementer. Propose the first concrete deliverable that proves the direction without over-scoping.";
+  }
+  if (role === "reviewer") {
+    if (creative) return "Stress-test the brief, scope, approval checkpoints, and the risk of making something polished before the direction is validated.";
+    if (analysis) return "Stress-test the data quality, narrative honesty, audience fit, and whether the proposed artifact can actually answer the question.";
+    if (research) return "Stress-test the evidence plan, scope, and whether the output will lead to a usable conclusion.";
+    if (product) return "Stress-test the assumptions, dependencies, and whether the first slice is small enough to evaluate cleanly.";
+    if (operations) return "Stress-test the workflow, blocker points, and where ownership or approval might break down.";
+    return "Stress-test the assumptions, scope, reviewability, and hidden risks in the proposed first pass.";
+  }
+  return "Be available for targeted input if another participant explicitly needs your perspective.";
+}
+
+function buildHallRuntimeRosterBlock(input: HallRuntimeDispatchInput): string {
+  const participantLines = input.hall.participants
+    .filter((participant) => participant.active !== false)
+    .map((participant) => {
+      const selfTag = participant.participantId === input.participant.participantId ? " (you)" : "";
+      const roleLabel = describeHallSemanticRole(participant.semanticRole);
+      const persona = describeHallParticipantWorkspacePersona(participant)
+        || describeHallParticipantLightPersona(participant.semanticRole);
+      const roundTask = describeHallParticipantRoundTask(input.taskCard, participant.participantId);
+      return roundTask
+        ? `- ${participant.displayName}${selfTag} — role: ${roleLabel}; persona: ${persona}; this round: ${roundTask}`
+        : `- ${participant.displayName}${selfTag} — role: ${roleLabel}; persona: ${persona}`;
+    });
+
+  if (participantLines.length === 0) return "";
+
+  return [
+    "Hall roster for this round:",
+    ...participantLines,
+    "Treat these as real teammates with different duties. Know what the others are responsible for before you reply, and do not steal a step that belongs to someone else.",
+  ].join("\n");
+}
+
+function describeHallSemanticRole(role: HallParticipant["semanticRole"]): string {
+  if (role === "planner") return "planner";
+  if (role === "coder") return "builder";
+  if (role === "reviewer") return "reviewer";
+  if (role === "manager") return "manager";
+  return "generalist";
+}
+
+function describeHallParticipantLightPersona(role: HallParticipant["semanticRole"]): string {
+  if (role === "planner") return "frames the task, pins the brief, keeps scope from drifting";
+  if (role === "coder") return "turns direction into a concrete draft or working slice fast";
+  if (role === "reviewer") return "only flags must-fix issues, trims scope, and hands it on when it is good enough";
+  if (role === "manager") return "closes loops, names the next owner, and pushes the room to a real next step";
+  return "fills a gap with one useful angle without taking over the whole thread";
+}
+
+function describeHallParticipantWorkspacePersona(participant: HallParticipant): string {
+  const workspaceId = normalizeLookup((participant.agentId ?? participant.participantId).trim());
+  if (!workspaceId) return "";
+  const cached = HALL_WORKSPACE_PERSONA_CACHE.get(workspaceId);
+  if (cached !== undefined) return cached;
+
+  const workspaceRoot = join(AGENT_WORKSPACES_ROOT, workspaceId);
+  const summary = summarizeWorkspacePersonaFromFiles(workspaceRoot);
+  HALL_WORKSPACE_PERSONA_CACHE.set(workspaceId, summary);
+  return summary;
+}
+
+export function summarizeWorkspacePersonaFromFiles(workspaceRoot: string): string {
+  const candidates: Array<{ text: string; score: number }> = [];
+  for (const fileName of HALL_WORKSPACE_PERSONA_FILES) {
+    const absolutePath = join(workspaceRoot, fileName);
+    if (!existsSync(absolutePath)) continue;
+    let raw = "";
+    try {
+      raw = readFileSync(absolutePath, "utf8");
+    } catch {
+      continue;
+    }
+    for (const candidate of extractWorkspacePersonaCandidates(raw, fileName)) {
+      candidates.push(candidate);
+    }
+  }
+
+  const seen = new Set<string>();
+  const lines = candidates
+    .sort((left, right) => right.score - left.score || left.text.length - right.text.length)
+    .map((candidate) => candidate.text)
+    .filter((text) => {
+      const normalized = normalizeLookup(text);
+      if (!normalized || seen.has(normalized)) return false;
+      seen.add(normalized);
+      return true;
+    })
+    .slice(0, 3);
+
+  return lines.join("; ");
+}
+
+function extractWorkspacePersonaCandidates(raw: string, fileName: string): Array<{ text: string; score: number }> {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n").map((line) => line.trim()).filter(Boolean);
+  const candidates: Array<{ text: string; score: number }> = [];
+
+  const pushCandidate = (text: string, score: number): void => {
+    const compact = text
+      .replace(/^[-*]\s*/, "")
+      .replace(/^#+\s*/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!compact) return;
+    if (/(this folder is home|every session|memory is limited|react like a human|safe to do freely|ask first|continuity|notes:|save this file|fill this in)/i.test(compact)) return;
+    if (/_\(.*\)_/.test(compact) || /pick something/i.test(compact)) return;
+    candidates.push({ text: compact, score });
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^<!--\s*(CUSTOMIZED|PERSONALIZED)/.test(line)) {
+      for (let offset = 1; offset <= 6 && index + offset < lines.length; offset += 1) {
+        const nextLine = lines[index + offset];
+        if (!nextLine || /^<!--/.test(nextLine) || /^##\s/.test(nextLine)) break;
+        if (/^[-*]/.test(nextLine)) pushCandidate(nextLine, 10 - offset);
+      }
+      continue;
+    }
+    if (fileName === "IDENTITY.md") {
+      if (/^-\s*(Name|Vibe|Role|角色|语气)\s*:/i.test(line) && !/[_(]/.test(line)) pushCandidate(line, 8);
+      continue;
+    }
+    if (fileName === "AGENTS.md") {
+      if (/^(you are|primary objective|mission|角色|任务边界|工作原则|definition of done|只做一件事|标准流程|质量门)/i.test(line)) pushCandidate(line, 9);
+      if (/^[-*]\s*(角色|语气|工作原则|边界|单一主任务|标准流程|质量门)/i.test(line)) pushCandidate(line, 9);
+    }
+    if (fileName === "SOUL.md") {
+      if (/^(你是|角色|语气|工作原则|边界|vibe|be genuinely helpful|have opinions)/i.test(line)) pushCandidate(line, 8);
+      if (/^[-*]\s*(角色|语气|工作原则|边界|你是|文章要|文字要|先给|代码变更必须)/i.test(line)) pushCandidate(line, 9);
+    }
+    if (fileName === "README.md" || fileName === "USER.md") {
+      if (/^(mission|role|you are|角色|目标|职责)/i.test(line)) pushCandidate(line, 6);
+      if (/^[-*]\s*(mission|role|角色|目标|职责)/i.test(line)) pushCandidate(line, 6);
+    }
+  }
+
+  return candidates;
+}
+
+function describeHallParticipantRoundTask(taskCard: HallTaskCard, participantId: string): string {
+  const current = taskCard.currentExecutionItem;
+  if (current?.participantId === participantId) {
+    return `current owner on "${current.task}"`;
+  }
+  const planned = taskCard.plannedExecutionItems.find((item) => item.participantId === participantId);
+  if (planned) {
+    const nextParticipant = planned.handoffToParticipantId?.trim();
+    const handoffClause = nextParticipant ? `, then hand to ${nextParticipant}` : "";
+    return `"${planned.task}"${handoffClause}`;
+  }
+  if (taskCard.currentOwnerParticipantId?.trim() === participantId && !current) {
+    return "current owner for this thread";
+  }
+  if (taskCard.mentionedParticipantIds.includes(participantId)) {
+    return "mentioned for targeted input";
+  }
+  return "";
+}
+
+function explicitHallMentionTargetLine(input: HallRuntimeDispatchInput): string {
+  const targets = input.triggerMessage?.mentionTargets
+    ?.map((target) => target.participantId)
+    .filter(Boolean)
+    .map((participantId) => input.hall.participants.find((participant) => participant.participantId === participantId)?.displayName || participantId)
+    ?? [];
+  if (targets.length === 0) return "";
+  return `The latest human message explicitly @mentioned: ${targets.join(", ")}. Respect that routing instead of broadening the room unless the human asks for more voices.`;
+}
+
+function buildPreviousTeammateHint(messages: HallMessage[], currentParticipantId: string): string {
+  const previousTeammate = [...messages]
+    .reverse()
+    .find((message) =>
+      message.authorParticipantId &&
+      message.authorParticipantId !== "operator" &&
+      message.authorParticipantId !== currentParticipantId &&
+      message.kind !== "system",
+    );
+  if (!previousTeammate) return "";
+  const compact = sanitizeHallVisibleRuntimeText(previousTeammate.content)
+    .replace(/<br\s*\/?>/gi, " / ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!compact) return "";
+  const clipped = compact.length > 220 ? `${compact.slice(0, 217).trim()}...` : compact;
+  return `The teammate you are building on is ${previousTeammate.authorLabel}. Their latest point was: "${clipped}". Add only the missing delta instead of paraphrasing them.`;
+}
+
+function dedupeHallPromptMessages(messages: HallMessage[]): HallMessage[] {
+  const ordered: HallMessage[] = [];
+  const seen = new Set<string>();
+  for (const message of messages) {
+    if (!message?.messageId || seen.has(message.messageId)) continue;
+    seen.add(message.messageId);
+    ordered.push(message);
+  }
+  return ordered;
+}
+
+function countRecentAgentContributors(messages: HallMessage[]): number {
+  const contributors = new Set<string>();
+  for (const message of messages) {
+    if (!message.authorParticipantId || message.authorParticipantId === "operator") continue;
+    contributors.add(message.authorParticipantId);
+  }
+  return contributors.size;
+}
+
+function buildHallRuntimeResult(input: {
+  input: HallRuntimeDispatchInput;
+  content: string;
+  structured: ParsedStructuredBlock;
+  sessionKey?: string;
+  sessionId?: string;
+}): HallRuntimeDispatchResult {
+  const { input: dispatch, content, structured, sessionKey, sessionId } = input;
+  const responseLanguage = inferHallResponseLanguage(
+    `${content}\n${dispatch.triggerMessage?.content ?? ""}\n${dispatch.taskCard.title}\n${dispatch.taskCard.description}`,
+  );
+  const operatorIntent = resolveHallOperatorIntent(dispatch);
+  const directResponseIntent = isDirectResponseIntent(operatorIntent) ? operatorIntent : undefined;
+  const visibleContent = dispatch.mode === "discussion"
+    ? (directResponseIntent
+        ? sanitizeDirectTaskVisibleRuntimeText(dispatch, content)
+        : sanitizeDiscussionVisibleRuntimeText(dispatch, content))
+    : compactHallCoworkerReply(content, responseLanguage);
+  const kind = resolveHallRuntimeMessageKind(dispatch, directResponseIntent);
+  const payload: HallMessage["payload"] = {
+    taskStage: dispatch.taskCard.stage,
+    taskStatus: dispatch.taskCard.status,
+    sessionKey,
+  };
+  const artifactRefs = resolveHallRuntimeArtifactRefs(dispatch, structured, visibleContent);
+  if (artifactRefs.length > 0) {
+    payload.artifactRefs = artifactRefs;
+  }
+  const taskCardPatch: HallRuntimeDispatchResult["taskCardPatch"] = {
+    latestSummary: structured.latestSummary ?? visibleContent,
+  };
+  const normalizedNextAction = normalizeImplicitHallExecutionNextAction(dispatch, structured, content);
+  const concreteDeliverable = enforceConcreteDeliverableReply(
+    dispatch,
+    visibleContent,
+    normalizedNextAction,
+    responseLanguage,
+    directResponseIntent,
+  );
+  if (concreteDeliverable.suppressVisibleMessage) {
+    taskCardPatch.latestSummary = dispatch.taskCard.latestSummary ?? taskCardPatch.latestSummary;
+  }
+
+  if (dispatch.mode === "discussion") {
+    if (dispatch.participant.semanticRole === "manager" && !directResponseIntent) {
+      const rawExecutor = structured.executor?.trim();
+      const executor = resolveExecutorParticipant(dispatch.hall, rawExecutor)
+        ?? pickFallbackExecutor(dispatch.hall, dispatch.taskCard, dispatch.task);
+      const sanitizedDecision = sanitizeManagerDiscussionText(
+        structured.decision ?? content,
+        rawExecutor,
+        executor?.displayName,
+      );
+      const sanitizedProposal = sanitizeManagerDiscussionText(
+        structured.proposal ?? dispatch.taskCard.proposal ?? dispatch.taskCard.latestSummary,
+        rawExecutor,
+        executor?.displayName,
+      );
+      const sanitizedDoneWhen = sanitizeManagerDiscussionText(
+        structured.doneWhen ?? dispatch.taskCard.doneWhen,
+        rawExecutor,
+        executor?.displayName,
+      );
+      const sanitizedLatestSummary = sanitizeManagerDiscussionText(
+        structured.latestSummary ?? content,
+        rawExecutor,
+        executor?.displayName,
+      );
+      const executionOrder = executor
+        ? buildRuntimeSuggestedExecutionOrder(dispatch.hall, dispatch.taskCard, executor.participantId)
+        : [];
+      payload.decision = sanitizedDecision;
+      payload.proposal = sanitizedProposal;
+      payload.doneWhen = sanitizedDoneWhen;
+      payload.nextOwnerParticipantId = executor?.participantId;
+      payload.executionOrder = executionOrder;
+      taskCardPatch.decision = payload.decision;
+      taskCardPatch.proposal = sanitizedProposal;
+      taskCardPatch.doneWhen = payload.doneWhen;
+      taskCardPatch.latestSummary = sanitizedLatestSummary;
+      const visibleDecision = payload.decision ?? `${dispatch.participant.displayName} closed the discussion.`;
+      const visibleDoneWhen = payload.doneWhen?.trim();
+      const visibleOrder = executionOrder
+        .map((participantId) => dispatch.hall.participants.find((participant) => participant.participantId === participantId)?.displayName ?? participantId)
+        .join(" -> ");
+      const managerLanguage = inferHallResponseLanguage(
+        `${dispatch.triggerMessage?.content ?? ""}\n${dispatch.taskCard.title}\n${dispatch.taskCard.description}`,
+      );
+      const visibleParts = managerLanguage === "zh"
+        ? [
+            payload.decision ?? `${dispatch.participant.displayName} 先收一下这轮。`,
+            executor ? `先给 ${executor.displayName} 开第一步。` : "",
+            visibleOrder && executionOrder.length > 1 ? `后面按 ${visibleOrder} 接。` : "",
+            visibleDoneWhen ? `这一轮做到：${visibleDoneWhen}。` : "",
+          ]
+        : [
+            payload.decision ?? `${dispatch.participant.displayName} is landing this round.`,
+            executor ? `Start with ${executor.displayName}.` : "",
+            visibleOrder && executionOrder.length > 1 ? `Then hand off in this order: ${visibleOrder}.` : "",
+            visibleDoneWhen ? `Done when: ${visibleDoneWhen}.` : "",
+          ];
+      return {
+        kind,
+        content: visibleParts.filter(Boolean).join(" "),
+        payload,
+        sessionKey,
+        sessionId,
+        chainDirective: {
+          nextAction: concreteDeliverable.nextAction,
+          nextStep: structured.nextStep,
+          executor: executor?.displayName ?? sanitizeManagerDiscussionText(rawExecutor, rawExecutor, executor?.displayName),
+        },
+        taskCardPatch,
+      };
+    } else {
+      payload.proposal = structured.proposal ?? content;
+      taskCardPatch.proposal = payload.proposal;
+      taskCardPatch.doneWhen = structured.doneWhen ?? dispatch.taskCard.doneWhen;
+    }
+  } else {
+    payload.status = dispatch.mode === "handoff" ? "runtime_handoff_update" : "runtime_execution_update";
+    payload.nextOwnerParticipantId = dispatch.participant.participantId;
+    if (structured.doneWhen) {
+      payload.doneWhen = structured.doneWhen;
+      taskCardPatch.doneWhen = structured.doneWhen;
+    }
+    if (structured.blockers) taskCardPatch.blockers = structured.blockers;
+    if (structured.requiresInputFrom) taskCardPatch.requiresInputFrom = structured.requiresInputFrom;
+  }
+
+  const implicitExecutor = undefined;
+
+  return {
+    kind,
+    content: concreteDeliverable.content,
+    suppressVisibleMessage: concreteDeliverable.suppressVisibleMessage,
+    payload,
+    sessionKey,
+    sessionId,
+    chainDirective: {
+      nextAction: concreteDeliverable.nextAction,
+      nextStep: concreteDeliverable.nextStep ?? structured.nextStep,
+      executor: implicitExecutor,
+    },
+    taskCardPatch,
+  };
+}
+
+export function compactHallCoworkerReply(content: string, language: HallResponseLanguage): string {
+  const normalized = sanitizeHallVisibleRuntimeText(content)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .trim();
+  if (!normalized) return content;
+  if (looksLikeConcreteExecutionDeliverable(normalized)) {
+    const maxLength = language === "zh" ? 2200 : 4200;
+    return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1).trim()}…` : normalized;
+  }
+  const rawSegments = normalized
+    .split(/\n+/)
+    .flatMap((line) => line.split(language === "zh" ? /(?<=[。！？])/ : /(?<=[.!?])\s+/))
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const seen = new Set<string>();
+  const segments = rawSegments.filter((segment) => {
+    if (seen.has(segment)) return false;
+    seen.add(segment);
+    return !/^(我先把|当前结果是|现阶段|一句话先锁|我这边先|这版先|我建议下一步|建议下一步|这里最重要的是|基于现有上下文|从.*角度来看|I want to clarify|At this stage|Current result:|Here is the current state|For this round|At this point|Based on the current context|The key thing is)/i.test(segment);
+  });
+  if (segments.length === 0) return normalized;
+  const scored = segments
+    .map((segment, index) => ({
+      segment,
+      index,
+      score:
+        (/@/.test(segment) ? 5 : 0) +
+        (/(下一步|接着|交给|接棒|继续|must-fix|blocker|卡住|review|handoff|next step|pass to|hand off)/i.test(segment) ? 3 : 0) +
+        (/(完成|锁住|改完|补完|done|ready|shipped|landed)/i.test(segment) ? 2 : 0) +
+        (segment.length <= (language === "zh" ? 48 : 90) ? 1 : 0),
+    }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .slice(0, 2)
+    .sort((left, right) => left.index - right.index)
+    .map((item) => item.segment);
+  const joined = scored.join("<br>");
+  const maxLength = language === "zh" ? 1200 : 2400;
+  return joined.length > maxLength ? `${joined.slice(0, maxLength - 1).trim()}…` : joined;
+}
+
+function looksLikeConcreteExecutionDeliverable(content: string): boolean {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  const deliverableListCount = countListLikeDeliverableItems(content);
+  const quotedItemCount = countQuotedDeliverableItems(content);
+  const inlineEnumeratedSteps = [...normalized.matchAll(/(?:^|[\s，,:：;；(（])([1-9])[、,.，．]\s*([^0-9][^]*?)(?=(?:[\s，,:：;；(（][1-9][、,.，．]\s*)|$)/g)];
+  const hasInlineEnumeration = new Set(inlineEnumeratedSteps.map((match) => match[1])).size >= 2;
+  return /(^|\n)\s*([0-9]+\.)\s/.test(content)
+    || hasInlineEnumeration
+    || deliverableListCount >= 3
+    || quotedItemCount >= 3
+    || /(thumbnail idea|hook 1|hook 2|hook 3|脚本初稿|thumbnail|hook 的三个版本|3 个 thumbnail idea|3 个 hook|3 条 hook|三条 hook|三个版本|方案一|方案二|方案三|版本一|版本二|版本三|开头 1|开头 2|开头 3|视频开头|口播开头|完整的三个视频开头|opening 1|opening 2|opening 3|intro 1|intro 2|intro 3|A\/B|A:|B:|must-fix|硬问题|硬缺口|可访问 URL|图片 URL|url|https?:\/\/|src\/[A-Za-z0-9._/-]+|collaboration-hall(?:-theme)?\.ts|server\.ts|hall-runtime-dispatch\.ts|orchestrator\.ts|types\.ts|README(?:\.zh-CN)?\.md|代码里|源码里|文件里|在 .*\\.ts 里)/i.test(normalized);
+}
+
+export function enforceConcreteDeliverableReply(
+  dispatch: HallRuntimeDispatchInput,
+  visibleContent: string,
+  nextAction: HallRuntimeNextAction | undefined,
+  language: HallResponseLanguage,
+  operatorIntent?: HallOperatorIntent,
+): ConcreteDeliverableEnforcement {
+  const strictDirectAsk = dispatch.mode === "discussion" && isDirectResponseIntent(operatorIntent);
+  if (dispatch.mode === "discussion" && !strictDirectAsk) {
+    return { content: visibleContent, nextAction };
+  }
+  const currentTask = dispatch.mode === "discussion"
+    ? (operatorIntent?.text ?? "")
+    : (resolveCurrentExecutionItem(dispatch.taskCard, dispatch.participant.participantId)?.task ?? "");
+  const requiresConcreteDeliverable = strictDirectAsk || requiresConcreteDeliverableForStep(currentTask);
+  if (!requiresConcreteDeliverable) {
+    return { content: visibleContent, nextAction };
+  }
+  if (nextAction === "blocked" || looksLikeBlockedExecutionUpdate(visibleContent)) {
+    return { content: visibleContent, nextAction };
+  }
+  if (strictDirectAsk) {
+    const deliverableKind = resolveConcreteDeliverableKind(currentTask, operatorIntent);
+    if (matchesConcreteDeliverableKind(deliverableKind, visibleContent)) {
+      return { content: visibleContent, nextAction };
+    }
+  } else if (looksLikeConcreteExecutionDeliverable(visibleContent)) {
+    return { content: visibleContent, nextAction };
+  }
+  return {
+    content: "",
+    nextAction: "continue",
+    suppressVisibleMessage: true,
+    nextStep: buildConcreteDeliverableRetryInstruction(currentTask, language, operatorIntent),
+  };
+}
+
+function countListLikeDeliverableItems(content: string): number {
+  const normalized = content
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/\r\n/g, "\n");
+  const lineMatches = normalized.match(/^\s*(?:开头\s*)?(?:[1-9]|[一二三四五六七八九])[、,.，．:：)\]]\s+/gmu) ?? [];
+  const inlineMatches = [
+    ...normalized.matchAll(/(?:^|[\s，,:：;；(（])(?:开头\s*)?([1-9]|[一二三四五六七八九])[、,.，．:：)\]]\s*/gmu),
+  ];
+  return Math.max(
+    lineMatches.length,
+    new Set(inlineMatches.map((match) => match[1])).size,
+  );
+}
+
+function countQuotedDeliverableItems(content: string): number {
+  const normalized = content.replace(/<br\s*\/?>/gi, "\n");
+  const chinese = normalized.match(/[“]([^”\n]{4,160})[”]/g) ?? [];
+  const english = normalized.match(/["]([^"\n]{4,160})["]/g) ?? [];
+  return chinese.length + english.length;
+}
+
+function resolveConcreteDeliverableKind(
+  task: string | undefined,
+  operatorIntent?: HallOperatorIntent,
+): ConcreteDeliverableKind {
+  const normalized = String(task || "").trim();
+  if (operatorIntent?.type === "review_request" || /(must-fix|review|审核|评审|检查|挑一下|挑出|只挑|硬问题|硬缺口)/i.test(normalized)) {
+    return "review";
+  }
+  if (operatorIntent?.type === "repo_scan_request" || /(repo|repository|codebase|source code|scan code|scan the repo|implementation|file path|workspace|代码|源码|仓库|扫描代码|扫代码|实现|文件)/i.test(normalized)) {
+    return "repo_scan";
+  }
+  if (/(thumbnail|缩略图)/i.test(normalized) && /(url|链接|image|图)/i.test(normalized)) {
+    return "thumbnail_urls";
+  }
+  if (/(thumbnail|缩略图)/i.test(normalized)) {
+    return "thumbnail_ideas";
+  }
+  if (/(视频开头|口播开头|开头文案|完整.*开头|完整可口播开头|video opening|spoken opening|spoken openings|intro line|intro lines|opening lines|开场白|开场文案|开头)/i.test(normalized)) {
+    return "spoken_openings";
+  }
+  if (/(hook|标题|文案)/i.test(normalized)) {
+    return "hooks";
+  }
+  if (/(script|脚本|台词|分镜|storyboard|outline)/i.test(normalized)) {
+    return "script";
+  }
+  return "generic";
+}
+
+function matchesConcreteDeliverableKind(kind: ConcreteDeliverableKind, content: string): boolean {
+  const normalized = sanitizeHallVisibleRuntimeText(content)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .trim();
+  if (!normalized) return false;
+  const listCount = countListLikeDeliverableItems(normalized);
+  const quoteCount = countQuotedDeliverableItems(normalized);
+  const pathMatches = normalized.match(/(?:^|[\s:(])(?:\/[^\s:]+?\.(?:ts|tsx|js|jsx|md|html)|src\/[A-Za-z0-9._/-]+?\.(?:ts|tsx|js|jsx|md|html))/g) ?? [];
+  const urlMatches = normalized.match(/(?:https?:\/\/|file:\/\/\/)[^\s]+/gi) ?? [];
+
+  switch (kind) {
+    case "repo_scan":
+      return pathMatches.length >= 2 && (
+        listCount >= 1
+        || /(结论|发现|负责|证明|说明|对应|shows|proves|responsible|handles|drives)/i.test(normalized)
+        || normalized.length >= 120
+      );
+    case "review":
+      return /(must-fix|不过|通过|pass|clean pass|硬问题|硬缺口|可以过|需要改)/i.test(normalized);
+    case "thumbnail_urls":
+      return urlMatches.length >= 3;
+    case "thumbnail_ideas":
+      return listCount >= 3 || quoteCount >= 3;
+    case "spoken_openings":
+      return /开头\s*[123一二三]/i.test(normalized)
+        || (quoteCount >= 3 && pathMatches.length === 0)
+        || (
+          listCount >= 3
+          && pathMatches.length === 0
+          && !/(src\/|runtime|dispatch|orchestrator|\.ts\b|README|代码|源码|文件路径|file path)/i.test(normalized)
+        );
+    case "hooks":
+      return listCount >= 3 || quoteCount >= 3;
+    case "script":
+      return listCount >= 2
+        || quoteCount >= 3
+        || normalized.split("\n").filter((line) => line.trim().length > 0).length >= 3
+        || normalized.length >= 160;
+    case "generic":
+    default:
+      return looksLikeConcreteExecutionDeliverable(normalized);
+  }
+}
+
+function normalizeImplicitHallExecutionNextAction(
+  dispatch: HallRuntimeDispatchInput,
+  structured: ParsedStructuredBlock,
+  content: string,
+): HallRuntimeNextAction | undefined {
+  if (structured.nextAction) return structured.nextAction;
+  if (dispatch.mode === "discussion") return undefined;
+  if ((structured.blockers?.length ?? 0) > 0) return "blocked";
+  if (looksLikeBlockedExecutionUpdate(content)) return "blocked";
+
+  const currentExecutionItem = resolveCurrentExecutionItem(dispatch.taskCard, dispatch.participant.participantId);
+  const queuedNextParticipantId = currentExecutionItem
+    ? (currentExecutionItem.handoffToParticipantId?.trim() || "")
+    : (dispatch.taskCard.plannedExecutionOrder[0] || "");
+  const nextParticipant = queuedNextParticipantId
+    ? dispatch.hall.participants.find((participant) => participant.participantId === queuedNextParticipantId)
+    : undefined;
+  if (dispatch.mode === "handoff" && nextParticipant && nextParticipant.participantId !== dispatch.participant.participantId) {
+    if (looksLikeNeedsAnotherPass(content)) return "continue";
+    return "handoff";
+  }
+  const seemsComplete = looksLikeCompletedExecutionUpdate(content);
+  if (!seemsComplete) return undefined;
+
+  if (nextParticipant && nextParticipant.participantId !== dispatch.participant.participantId) {
+    return "handoff";
+  }
+  return "review";
+}
+
+function looksLikeCompletedExecutionUpdate(content: string): boolean {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  if (looksLikeBlockedExecutionUpdate(normalized)) return false;
+  return /(这一步.*(完成|做完|够了|成立|可以交给|收住)|已经(完成|补完|锁定|收住|够了)|可直接交给|下一步.*(交给|给)|交给\s*@?[A-Za-z0-9_\-\u4e00-\u9fa5]+|现在请\s*@?[A-Za-z0-9_\-\u4e00-\u9fa5]+|就可以\s*@?[A-Za-z0-9_\-\u4e00-\u9fa5]+|继续交给\s*@?[A-Za-z0-9_\-\u4e00-\u9fa5]+|ready for review|ready to hand off|handoff|hand off|hand it to|pass(?: it)? to|turn it over to|the next step is|can go to|send this to|ship this to)/i.test(normalized);
+}
+
+function requiresConcreteDeliverableForStep(task: string | undefined): boolean {
+  const normalized = String(task || "").trim();
+  if (!normalized) return true;
+  if (/(承接上一步|继续推进|继续做|继续这一轮|收口这轮|检查上一位结果|指出必须修改项|review|评审|must-fix|硬问题|硬缺口|交接|handoff|next action)/i.test(normalized)) {
+    return true;
+  }
+  return /(出|写|生成|产出|补|整理|收成|总结|锁定|给出|扫描|扫代码|扫描代码|看代码|看仓库|查仓库|repo|repository|codebase|source code|implementation|file path|workspace|draft|deliver|write|generate|produce|summarize|scan|inspect|review the repo|turn .* into|thumbnail|hook|script|brief|copy|idea|summary|文案|脚本|摘要|分镜|镜头|台词|样本|版本|源码|仓库|实现|文件)/i.test(normalized);
+}
+
+function buildConcreteDeliverableRetryInstruction(
+  task: string | undefined,
+  language: HallResponseLanguage,
+  operatorIntent?: HallOperatorIntent,
+): string {
+  const kind = resolveConcreteDeliverableKind(task, operatorIntent);
+  if (kind === "repo_scan") {
+    return language === "zh"
+      ? "别再讲原则或价值，下一条直接贴代码发现：至少 2 个真实文件路径，并说明每个文件证明了什么。"
+      : "Stop meta-discussing and post concrete repo findings next: cite at least two real file paths and what each file proves.";
+  }
+  if (kind === "thumbnail_urls") {
+    return language === "zh"
+      ? "别再讲原则或价值，下一条直接贴 3 个 thumbnail 方向和对应 URL。"
+      : "Stop meta-discussing and post the concrete deliverable next: three thumbnail directions plus their URLs.";
+  }
+  if (kind === "thumbnail_ideas") {
+    return language === "zh"
+      ? "别再讲原则或价值，下一条直接贴 3 个 thumbnail 方向。"
+      : "Stop meta-discussing and post the concrete deliverable next: three thumbnail directions.";
+  }
+  if (kind === "spoken_openings") {
+    return language === "zh"
+      ? "别再讲原则或价值，下一条直接贴 3 个完整可口播的视频开头。"
+      : "Stop meta-discussing and post the concrete deliverable next: three complete spoken video openings.";
+  }
+  if (kind === "hooks") {
+    return language === "zh"
+      ? "别再讲原则或价值，下一条直接贴 3 个 hook。"
+      : "Stop meta-discussing and post the concrete deliverable next: three hooks.";
+  }
+  if (kind === "script") {
+    return language === "zh"
+      ? "别再讲原则或价值，下一条直接贴脚本/台词/分镜初稿。"
+      : "Stop meta-discussing and post the concrete deliverable next: the draft script, lines, or storyboard.";
+  }
+  return language === "zh"
+    ? "别再讲原则或价值，下一条直接贴具体产物。"
+    : "Stop meta-discussing and post the concrete deliverable in the next reply.";
+}
+
+function buildConcreteExecutionOutputRequirement(
+  task: string | undefined,
+  language: HallResponseLanguage,
+  operatorIntent?: HallOperatorIntent,
+): string {
+  const kind = resolveConcreteDeliverableKind(task, operatorIntent);
+  if (kind === "repo_scan") {
+    return language === "zh"
+      ? "这一步必须直接贴 repo 发现：至少 3 个真实文件路径，并说明每个文件负责什么或证明了什么。"
+      : "This step must post concrete repo findings: cite at least three real file paths and what each file is responsible for or proves.";
+  }
+  if (kind === "thumbnail_urls") {
+    return language === "zh"
+      ? "这一步必须直接贴交付物：3 个 thumbnail 方向，并给出对应可访问 URL。"
+      : "This step must post the deliverable itself: three thumbnail directions plus their accessible URLs.";
+  }
+  if (kind === "thumbnail_ideas") {
+    return language === "zh"
+      ? "这一步必须直接贴交付物：3 个 thumbnail 方向。"
+      : "This step must post the deliverable itself: three thumbnail directions.";
+  }
+  if (kind === "spoken_openings") {
+    return language === "zh"
+      ? "这一步必须直接贴交付物：3 个完整可口播的视频开头。"
+      : "This step must post the deliverable itself: three complete spoken video openings.";
+  }
+  if (kind === "hooks") {
+    return language === "zh"
+      ? "这一步必须直接贴交付物：3 个 hook 完整版本。"
+      : "This step must post the deliverable itself: three full hook versions.";
+  }
+  if (kind === "script") {
+    return language === "zh"
+      ? "这一步必须直接贴交付物：脚本/台词/分镜初稿。"
+      : "This step must post the deliverable itself: the draft script, lines, or storyboard.";
+  }
+  return language === "zh"
+    ? "这一步必须直接贴交付物本身，不要只评论方向。"
+    : "This step must post the concrete deliverable itself, not just commentary about the direction.";
+}
+
+function looksLikeMetaExecutionDiscussion(content: string): boolean {
+  const normalized = sanitizeHallVisibleRuntimeText(content).replace(/<br\s*\/?>/gi, " ").replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  const hasConcreteShape =
+    /(^|\s)([-*•]|[0-9]+\.)\s/.test(normalized)
+    || /[“"][^“"\n]{4,}[”"]/.test(normalized)
+    || /https?:\/\//i.test(normalized)
+    || /(A\/B|A:|B:|方案一|方案二|版本一|版本二|脚本初稿|thumbnail idea|hook 1|hook 2|must-fix)/i.test(normalized);
+  if (hasConcreteShape) return false;
+  return /(第一版里|最好|更适合|这样|不然|价值|观众|画面|样本|约束|风险|方向|更像|说明|证明|优先|建议|适合|最稳|关键不是|缺的角度|最该|这版.*(更|会)|不会被.*带跑|一眼读完|人工|协调成本)/i.test(normalized);
+}
+
+function looksLikeBlockedExecutionUpdate(content: string): boolean {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  return /(卡住|阻塞|缺少|缺失|拿不到|没有.*(上下文|代码|文件|权限|信息)|无法|不能继续|still need|still missing|blocked on|blocked by|can't continue|cannot continue|need more context|need the repo|need the file)/i.test(normalized);
+}
+
+function looksLikeNeedsAnotherPass(content: string): boolean {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  if (looksLikeBlockedExecutionUpdate(normalized)) return false;
+  return /(我先再|我还要再|我再补一轮|我再改一轮|我先继续改|我先补完|需要我再|我继续把这一步|one more pass|another pass|i will revise|i'll revise|i will keep refining|i'll keep refining|i need one more pass|let me tighten this)/i.test(normalized);
+}
+
+function resolveHallRuntimeMessageKind(
+  input: HallRuntimeDispatchInput,
+  operatorIntent?: HallOperatorIntent,
+): HallMessage["kind"] {
+  if (input.mode === "discussion") {
+    if (isDirectResponseIntent(operatorIntent)) return "status";
+    return input.participant.semanticRole === "manager" ? "decision" : "proposal";
+  }
+  return input.mode === "handoff" ? "handoff" : "status";
+}
+
+function pickFallbackExecutor(
+  hall: CollaborationHall,
+  taskCard: HallTaskCard,
+  task?: ProjectTask,
+): HallParticipant | undefined {
+  const domain = inferRuntimeDiscussionDomain(taskCard, task);
+  for (const role of runtimeRecommendedExecutorRoleOrder(domain)) {
+    const participant = pickRuntimeParticipantForRole(hall.participants, role);
+    if (participant) return participant;
+  }
+  return hall.participants.find((participant) => participant.semanticRole === "planner" && participant.active)
+    ?? hall.participants.find((participant) => participant.semanticRole === "coder" && participant.active)
+    ?? hall.participants.find((participant) => participant.active)
+    ?? hall.participants[0];
+}
+
+function buildRuntimeSuggestedExecutionOrder(
+  hall: CollaborationHall,
+  taskCard: HallTaskCard,
+  firstOwnerParticipantId: string,
+): string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const participantId of [
+    firstOwnerParticipantId,
+    ...taskCard.requiresInputFrom,
+    ...taskCard.mentionedParticipantIds,
+  ]) {
+    if (!participantId || seen.has(participantId)) continue;
+    if (!hall.participants.some((participant) => participant.participantId === participantId)) continue;
+    seen.add(participantId);
+    ordered.push(participantId);
+  }
+  return ordered;
+}
+
+function inferRuntimeDiscussionDomain(taskCard: HallTaskCard, task: ProjectTask | undefined): string {
+  return inferHallDiscussionDomainFromText(`${taskCard.title}\n${taskCard.description}\n${task?.title ?? ""}`);
+}
+
+function runtimeRecommendedExecutorRoleOrder(domain: string): HallSemanticRole[] {
+  if (domain === "engineering") return ["coder", "planner", "manager"];
+  if (domain === "creative") return ["planner", "coder", "generalist"];
+  if (domain === "analysis") return ["planner", "coder", "reviewer"];
+  if (domain === "product") return ["planner", "manager", "coder"];
+  if (domain === "research") return ["planner", "reviewer", "manager"];
+  if (domain === "operations") return ["manager", "planner", "reviewer"];
+  return ["planner", "generalist", "manager", "coder"];
+}
+
+function pickRuntimeParticipantForRole(
+  participants: HallParticipant[],
+  role: HallSemanticRole,
+): HallParticipant | undefined {
+  if (role === "generalist") {
+    return participants.find((participant) => participant.active && participant.semanticRole === "generalist");
+  }
+  return participants.find((participant) => participant.active && participant.semanticRole === role);
+}
+
+function resolveExecutorParticipant(hall: CollaborationHall, rawExecutor: string | undefined): HallParticipant | undefined {
+  const query = rawExecutor?.trim();
+  if (!query) return undefined;
+  const normalized = normalizeLookup(query);
+  return hall.participants.find((participant) => {
+    if (normalizeLookup(participant.participantId) === normalized) return true;
+    if (normalizeLookup(participant.displayName) === normalized) return true;
+    return participant.aliases.some((alias) => normalizeLookup(alias) === normalized);
+  });
+}
+
+function detectExplicitMentionedParticipant(
+  hall: CollaborationHall,
+  content: string | undefined,
+  excludeParticipantId?: string,
+): HallParticipant | undefined {
+  const normalizedContent = String(content || "").trim();
+  if (!normalizedContent) return undefined;
+  const mentionPattern = /(^|[\s(>\[\{<,.;:!?"'“”‘’，。！？；：、）】」』》])@([A-Za-z0-9_\-\u4e00-\u9fff]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = mentionPattern.exec(normalizedContent))) {
+    const participant = resolveExecutorParticipant(hall, match[2]);
+    if (!participant) continue;
+    if (excludeParticipantId && participant.participantId === excludeParticipantId) continue;
+    return participant;
+  }
+  return undefined;
+}
+
+function pickExpectedSessionKey(taskCard: HallTaskCard, agentId: string): string | undefined {
+  const normalizedAgentId = normalizeLookup(agentId);
+  const linked = taskCard.sessionKeys.find((sessionKey) => normalizeLookup(sessionKey).includes(`agent:${normalizedAgentId}:`));
+  return linked ?? (normalizedAgentId ? `agent:${agentId}:main` : undefined);
+}
+
+async function safeReadHistory(client: ToolClient, sessionKey: string): Promise<SessionHistoryMessage[]> {
+  const history = await readSessionConversationHistory(client, sessionKey, HALL_RUNTIME_HISTORY_LIMIT);
+  return history.history;
+}
+
+function renderRuntimeDraftText(
+  messages: SessionHistoryMessage[],
+  baselineFingerprint: string | undefined,
+): string {
+  const incremental = sliceMessagesAfterFingerprint(messages, baselineFingerprint);
+  const segments = incremental
+    .flatMap((message) => formatRuntimeStreamSegments(message))
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  return segments.join("\n\n");
+}
+
+function sliceMessagesAfterFingerprint(
+  messages: SessionHistoryMessage[],
+  baselineFingerprint: string | undefined,
+): SessionHistoryMessage[] {
+  if (!baselineFingerprint) return messages;
+  let lastIndex = -1;
+  for (let index = 0; index < messages.length; index += 1) {
+    if (fingerprintHistoryMessage(messages[index]) === baselineFingerprint) lastIndex = index;
+  }
+  return lastIndex >= 0 ? messages.slice(lastIndex + 1) : messages;
+}
+
+function fingerprintHistoryMessage(message: SessionHistoryMessage): string {
+  return [
+    message.kind,
+    message.role,
+    message.timestamp ?? "",
+    message.toolName ?? "",
+    message.content.trim(),
+  ].join("|");
+}
+
+function formatRuntimeStreamSegments(message: SessionHistoryMessage): string[] {
+  if (message.kind === "tool_event") return [];
+  const role = message.role.trim().toLowerCase();
+  if (role === "user" || role === "system") return [];
+  const content = sanitizeHallVisibleRuntimeText(message.content);
+  if (!content) return [];
+  return [content];
+}
+
+function extractStructuredBlock(rawText: string): { visibleText: string; structured: ParsedStructuredBlock } {
+  const match = /<hall-structured>\s*([\s\S]*?)\s*<\/hall-structured>/i.exec(rawText);
+  if (!match) {
+    const danglingStructuredStart = rawText.search(/<hall-structured>/i);
+    const visibleText = (danglingStructuredStart >= 0 ? rawText.slice(0, danglingStructuredStart) : rawText).trim();
+    return { visibleText, structured: {} };
+  }
+  let structured: ParsedStructuredBlock = {};
+  try {
+    const parsed = JSON.parse(match[1]) as Record<string, unknown>;
+    structured = {
+      proposal: asOptionalString(parsed.proposal),
+      decision: asOptionalString(parsed.decision),
+      executor: asOptionalString(parsed.executor),
+      doneWhen: asOptionalString(parsed.doneWhen),
+      blockers: asOptionalStringArray(parsed.blockers),
+      requiresInputFrom: asOptionalStringArray(parsed.requiresInputFrom),
+      latestSummary: asOptionalString(parsed.latestSummary),
+      nextAction: asOptionalNextAction(parsed.nextAction),
+      nextStep: asOptionalString(parsed.nextStep),
+      artifactRefs: asOptionalArtifactRefs(parsed.artifactRefs),
+    };
+  } catch {
+    structured = {};
+  }
+  const visibleText = rawText.replace(match[0], "").trim();
+  return { visibleText, structured };
+}
+
+function buildFallbackVisibleContent(input: HallRuntimeDispatchInput, rawText: string): string {
+  const trimmed = sanitizeHallVisibleRuntimeText(rawText);
+  if (trimmed) return trimmed;
+  const language = inferHallResponseLanguage(
+    input.triggerMessage?.content
+      ?? `${input.taskCard.title}\n${input.taskCard.description}\n${input.task?.title ?? ""}`,
+  );
+  if (input.mode === "discussion" && input.participant.semanticRole === "manager") {
+    return language === "zh"
+      ? `${input.participant.displayName} 先收住这轮，直接定人开做。`
+      : `${input.participant.displayName} landed this round and the next owner can start now.`;
+  }
+  if (input.mode === "discussion") {
+    return language === "zh"
+      ? `${input.participant.displayName} 补了一个关键角度。`
+      : `${input.participant.displayName} added one useful angle.`;
+  }
+  if (input.mode === "handoff") {
+    return language === "zh"
+      ? `${input.participant.displayName} 接棒了，继续往下做。`
+      : `${input.participant.displayName} took the handoff and is moving it forward.`;
+  }
+  return language === "zh"
+    ? `${input.participant.displayName} 把这一步往前推进了。`
+    : `${input.participant.displayName} moved this step forward.`;
+}
+
+function sanitizeDiscussionVisibleRuntimeText(
+  dispatch: HallRuntimeDispatchInput,
+  raw: string,
+): string {
+  const sanitized = sanitizeHallVisibleRuntimeText(raw);
+  const normalizedMentions = normalizeHallVisibleMentions(dispatch, sanitized);
+  if (dispatch.participant.semanticRole === "manager") {
+    return compactHallDiscussionReply(normalizedMentions, inferHallResponseLanguage(raw));
+  }
+
+  return compactHallDiscussionReply(normalizedMentions, inferHallResponseLanguage(raw));
+}
+
+function sanitizeDirectTaskVisibleRuntimeText(
+  dispatch: HallRuntimeDispatchInput,
+  raw: string,
+): string {
+  const sanitized = sanitizeHallVisibleRuntimeText(raw);
+  return normalizeHallVisibleMentions(dispatch, sanitized);
+}
+
+function normalizeHallVisibleMentions(
+  dispatch: HallRuntimeDispatchInput,
+  sanitized: string,
+): string {
+  const allowedMentions = new Set<string>();
+  for (const target of dispatch.triggerMessage?.mentionTargets ?? []) {
+    const participant = target.participantId
+      ? dispatch.hall.participants.find((item) => item.participantId === target.participantId)
+      : undefined;
+    if (!participant) continue;
+    for (const alias of [participant.participantId, participant.displayName, ...participant.aliases]) {
+      const normalized = normalizeLookup(String(alias || ""));
+      if (normalized) allowedMentions.add(normalized);
+    }
+  }
+
+  const rewriteMention = (prefix: string, rawName: string): string => {
+    const participant = resolveExecutorParticipant(dispatch.hall, rawName);
+    if (!participant) return `${prefix}@${rawName}`;
+    const keepMention =
+      allowedMentions.size > 0 &&
+      [participant.participantId, participant.displayName, ...participant.aliases]
+        .map((value) => normalizeLookup(String(value || "")))
+        .some((value) => value && allowedMentions.has(value));
+    return keepMention
+      ? `${prefix}@${participant.displayName}`
+      : `${prefix}${participant.displayName}`;
+  };
+
+  const normalizedMentions = sanitized
+    .replace(/(^|[\s(>])@([A-Za-z0-9_\-\u4e00-\u9fff]+)/g, (_match, prefix: string, rawName: string) => rewriteMention(prefix, rawName))
+    .replace(/(<br\s*\/?>)@([A-Za-z0-9_\-\u4e00-\u9fff]+)/gi, (_match, prefix: string, rawName: string) => rewriteMention(prefix, rawName));
+  return normalizedMentions;
+}
+
+export function compactHallDiscussionReply(content: string, language: HallResponseLanguage): string {
+  const normalized = sanitizeHallVisibleRuntimeText(content)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .trim();
+  if (!normalized) return content;
+
+  const rawSegments = normalized
+    .split(/\n+/)
+    .flatMap((line) => line.split(language === "zh" ? /(?<=[。！？])/ : /(?<=[.!?])\s+/))
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const seen = new Set<string>();
+  const segments = rawSegments.filter((segment) => {
+    if (seen.has(segment)) return false;
+    seen.add(segment);
+    return !/^(先锁一个点|我只补一个点|再补一个点|再补个风险|一句话先锁|One angle|One gap|One missing piece|I only want to add one point)/i.test(segment)
+      && !/(数据缺失|未验证素材|验收标准|创意约束|not a verified finding|validation constraint)/i.test(segment);
+  });
+
+  if (segments.length === 0) return normalized;
+
+  const scored = segments
+    .map((segment, index) => ({
+      segment,
+      index,
+      score:
+        (/@/.test(segment) ? 4 : 0) +
+        (/(风险|缺口|要补|最好|只要|必须|关键|next action|owner|blocker|must-fix|need|should|missing|risk)/i.test(segment) ? 3 : 0) +
+        (segment.length <= (language === "zh" ? 72 : 120) ? 1 : 0),
+    }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .slice(0, 2)
+    .sort((left, right) => left.index - right.index)
+    .map((item) => item.segment);
+
+  return scored.join("<br>");
+}
+
+function sanitizeManagerDiscussionText(
+  value: string | undefined,
+  rawExecutor: string | undefined,
+  resolvedExecutorLabel: string | undefined,
+): string | undefined {
+  const normalizedValue = value?.trim();
+  const staleExecutor = rawExecutor?.trim();
+  const safeExecutorLabel = resolvedExecutorLabel?.trim();
+  if (!normalizedValue) return undefined;
+  let sanitized = normalizedValue
+    .replace(/(?:^|\n)\s*(Suggested first executor|Suggested order|Done when|Recommendation|Decision)\s*:\s*/giu, "$1: ")
+    .replace(/\b(Suggested first executor|Suggested order|Done when)\s*:\s*/giu, "")
+    .trim();
+  if (!staleExecutor || !safeExecutorLabel) return sanitized;
+  if (normalizeLookup(staleExecutor) === normalizeLookup(safeExecutorLabel)) return sanitized;
+  const pattern = new RegExp(escapeRegExp(staleExecutor), "giu");
+  sanitized = sanitized.replace(pattern, safeExecutorLabel);
+  return sanitized;
+}
+
+function inferHallResponseLanguage(source: string | undefined): HallResponseLanguage {
+  const value = String(source ?? "").trim();
+  if (!value) return "en";
+  const cjkMatches = value.match(/[\u4e00-\u9fff]/g) ?? [];
+  const latinMatches = value.match(/[A-Za-z]/g) ?? [];
+  if (cjkMatches.length > 0) return "zh";
+  if (latinMatches.length > 0) return "en";
+  return "en";
+}
+
+function normalizeLookup(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function asOptionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function asOptionalStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const normalized = value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter(Boolean);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function asOptionalNextAction(value: unknown): HallRuntimeNextAction | undefined {
+  if (typeof value !== "string") return undefined;
+  switch (value.trim().toLowerCase()) {
+    case "continue":
+    case "review":
+    case "blocked":
+    case "handoff":
+    case "done":
+      return value.trim().toLowerCase() as HallRuntimeNextAction;
+    default:
+      return undefined;
+  }
+}
+
+function asOptionalArtifactRefs(value: unknown): TaskArtifact[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const refs = value
+    .map((item) => normalizeRuntimeArtifactRef(item))
+    .filter((item): item is TaskArtifact => Boolean(item));
+  return refs.length > 0 ? refs : undefined;
+}
+
+function normalizeRuntimeArtifactRef(value: unknown): TaskArtifact | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const object = value as Record<string, unknown>;
+  const location = typeof object.location === "string" ? object.location.trim() : "";
+  if (!location) return undefined;
+  const label = typeof object.label === "string" && object.label.trim()
+    ? object.label.trim()
+    : inferArtifactLabelFromLocation(location);
+  const explicitType = typeof object.type === "string" ? object.type.trim().toLowerCase() : "";
+  const type = explicitType === "code" || explicitType === "doc" || explicitType === "link" || explicitType === "other"
+    ? explicitType
+    : inferArtifactTypeFromLocation(location);
+  const artifactId = typeof object.artifactId === "string" && object.artifactId.trim()
+    ? object.artifactId.trim()
+    : buildRuntimeArtifactId(location);
+  return {
+    artifactId,
+    type,
+    label,
+    location,
+  };
+}
+
+function resolveHallRuntimeArtifactRefs(
+  dispatch: HallRuntimeDispatchInput,
+  structured: ParsedStructuredBlock,
+  visibleContent: string,
+): TaskArtifact[] {
+  return mergeArtifactRefs(
+    dispatch.mode === "handoff" ? dispatch.handoff?.artifactRefs : undefined,
+    structured.artifactRefs,
+    extractArtifactRefsFromVisibleContent(visibleContent),
+  );
+}
+
+function mergeArtifactRefs(...groups: Array<TaskArtifact[] | undefined>): TaskArtifact[] {
+  const merged = new Map<string, TaskArtifact>();
+  for (const group of groups) {
+    if (!group || group.length === 0) continue;
+    for (const artifact of group) {
+      if (!artifact?.location) continue;
+      const key = normalizeLookup(artifact.location);
+      if (merged.has(key)) continue;
+      merged.set(key, artifact);
+    }
+  }
+  return [...merged.values()];
+}
+
+function extractArtifactRefsFromVisibleContent(content: string): TaskArtifact[] {
+  const refs: TaskArtifact[] = [];
+  const seen = new Set<string>();
+  const pushRef = (location: string, label?: string): void => {
+    const normalizedLocation = location.trim();
+    if (!normalizedLocation) return;
+    const key = normalizeLookup(normalizedLocation);
+    if (seen.has(key)) return;
+    seen.add(key);
+    refs.push({
+      artifactId: buildRuntimeArtifactId(normalizedLocation),
+      type: inferArtifactTypeFromLocation(normalizedLocation),
+      label: label?.trim() || inferArtifactLabelFromLocation(normalizedLocation),
+      location: normalizedLocation,
+    });
+  };
+
+  const markdownImagePattern = /!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/gi;
+  const markdownLinkPattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi;
+  const urlPattern = /https?:\/\/[^\s<)]+/gi;
+
+  for (const match of content.matchAll(markdownImagePattern)) {
+    pushRef(match[2] ?? "", match[1] ?? "");
+  }
+  for (const match of content.matchAll(markdownLinkPattern)) {
+    pushRef(match[2] ?? "", match[1] ?? "");
+  }
+  for (const match of content.matchAll(urlPattern)) {
+    pushRef(match[0] ?? "");
+  }
+
+  return refs;
+}
+
+function buildRuntimeArtifactId(seed: string): string {
+  return `artifact-${stableRuntimeHash(seed).toString(16)}`;
+}
+
+function stableRuntimeHash(input: string): number {
+  let hash = 0;
+  for (let index = 0; index < input.length; index += 1) {
+    hash = (hash * 33 + input.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+}
+
+function inferArtifactTypeFromLocation(location: string): TaskArtifact["type"] {
+  const normalized = location.trim().toLowerCase();
+  if (/\.(ts|tsx|js|jsx|json|py|rb|go|rs|java|kt|swift|sh|sql|yaml|yml)(?:[?#].*)?$/.test(normalized)) {
+    return "code";
+  }
+  if (/\.(md|txt|pdf|docx?|pptx?|csv|xlsx?)(?:[?#].*)?$/.test(normalized)) {
+    return "doc";
+  }
+  if (/^https?:\/\//.test(normalized)) {
+    return "link";
+  }
+  return "other";
+}
+
+function inferArtifactLabelFromLocation(location: string): string {
+  try {
+    const url = new URL(location);
+    const pathname = url.pathname.split("/").filter(Boolean);
+    return pathname.at(-1) || url.hostname || location;
+  } catch {
+    const tokens = location.split(/[\\/]/).filter(Boolean);
+    return tokens.at(-1) || location;
+  }
+}
+
+function sanitizeDirectRuntimeOutput(raw: string): string {
+  return sanitizeHallVisibleRuntimeText(raw);
+}
+
+function sanitizeHallVisibleRuntimeText(raw: string | undefined): string {
+  const value = String(raw ?? "");
+  const normalized = value
+    .replace(/\u001B\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\r/g, "\n")
+    .replace(/<hall-structured>[\s\S]*?(?:<\/hall-structured>|$)/gi, "")
+    .replace(/",\s*"(nextAction|nextStep|latestSummary|artifactRefs|proposal|decision|executor|doneWhen|blockers|requiresInputFrom)"\s*:\s*[\s\S]*$/i, "");
+  const lines = normalized
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !line.startsWith("🦞 OpenClaw"))
+    .filter((line) => !line.startsWith("Registered plugin command:"))
+    .filter((line) => !/Waiting for agent reply/i.test(line))
+    .filter((line) => !/^[◒◐◓◑◇│]+$/.test(line))
+    .filter((line) => !/^流式中$/i.test(line))
+    .filter((line) => !/<\/?hall-structured>/i.test(line))
+    .filter((line) => !/^[,{]?\s*"?(nextAction|nextStep|latestSummary|artifactRefs|proposal|decision|executor|doneWhen|blockers|requiresInputFrom)"\s*:/i.test(line))
+    .filter((line) => !/^\[tool(?:[^\]]*)?\]/i.test(line))
+    .filter((line) => !/^thinking\b/i.test(line))
+    .filter((line) => !/^Inspecting\b/i.test(line))
+    .filter((line) => !/^Checking\b/i.test(line))
+    .filter((line) => !/^Considering\b/i.test(line))
+    .filter((line) => !/^Maybe\b/i.test(line))
+    .filter((line) => !/^It seems\b/i.test(line))
+    .filter((line) => !/^Since the user\b/i.test(line))
+    .filter((line) => !/^I should\b/i.test(line))
+    .filter((line) => !/^I think\b/i.test(line))
+    .filter((line) => !/^I might\b/i.test(line))
+    .filter((line) => !/^I can\b/i.test(line))
+    .filter((line) => !/^Let's\b/i.test(line))
+    .filter((line) => !/^\[\/?tool\]/i.test(line))
+    .filter((line) => !/^```(?:ts|tsx|js|jsx|json|sh|bash)?$/i.test(line))
+    .filter((line) => !/^(import|export)\s+/i.test(line))
+    .filter((line) => !/(数据缺失|未验证素材|验收标准|创意约束|not a verified finding|validation constraint)/i.test(line));
+  if (lines.length === 0 && value.includes("<hall-structured>")) {
+    return "";
+  }
+  return lines.join("\n").trim();
+}

@@ -20,12 +20,14 @@
 - `总览`：系统状态、待处理事项、关键风险和运营摘要
 - `用量`：用量、花费、订阅窗口和连接状态
 - `员工`：谁真的在工作，谁只是排队待命
-- `协作`：父子会话接力与智能体之间的跨会话通信
+- `协作`：一个 hall-first 的多 agent 工作群，可以在同一条线程里讨论、排顺序、交接、评审
 - `任务`：当前任务、审批、执行链和运行证据
 - `文档` 与 `记忆`：按活跃 OpenClaw agent 范围展示的源文件工作台
 
 ## 这个版本新增了什么
-- `协作`：新增独立 `协作` 页面，直接看父子会话接力和 `Main ⇄ Pandas` 这种已验证跨会话通信，不再只看执行链猜关系。
+- `协作`：新增 hall-first 的独立 `协作` 页面，任务可以先在共享时间线里讨论、再收口到执行 owner，而不是只靠父子会话去猜任务怎么推进。
+- `协作`：hall 里的讨论、指派和交接现在可以走真实 `openclaw agent` 运行时，草稿流和最终落地消息都会回到同一条线程。
+- `协作`：hall 现在直接使用你当前 OpenClaw roster 里的 agent id 和显示名；已有用户不需要把 agent 改名成任何 control-center 私有名字就能接入。
 - `设置`：新增 `接线状态`，直接告诉你哪些数据已经接好、哪些还差一步，以及该去哪里补。
 - `设置`：新增 `安全风险摘要`，把当前风险、影响和下一步建议翻译成人话。
 - `设置`：新增 `更新状态`，直接看当前版本、最新版本、更新通道和安装方式。
@@ -65,10 +67,26 @@
     </td>
   </tr>
   <tr>
-    <td><strong>协作页</strong><br />直接看父子会话接力，以及像 <code>Main ⇄ Pandas</code> 这样的已验证跨会话通信。</td>
+    <td><strong>协作页</strong><br />直接看多 agent 在同一条线程里讨论、拍板、执行、交接和评审，而不是把协作关系藏在不同会话里。</td>
     <td><strong>安全与更新状态</strong><br />直接看当前风险、影响、下一步建议，以及当前版本和最新版本。</td>
   </tr>
 </table>
+
+## hall 如何接入你现有的 agent
+- hall 会读取当前 OpenClaw 运行环境里的 roster，直接使用你已经在用的 agent id 和显示名。
+- 已有用户不需要把 agent 改名成 `pandas`、`coq`、`monkey` 这类 control-center 示例名，直接接入即可。
+- hall 的角色建议只是启发式，不是强绑定；如果你的 roster 名字里带有 `manager`、`planner`、`builder`、`qa` 之类信号，会优先用这些信号，否则会平滑降级，不会因为名字不匹配而卡住。
+- hall 运行时现在会把 `surface`、`workspaceRoot`、`workdir`、关键入口文件和 artifact 引用一起传给 agent，让 repo-aware 的任务尽量获得和其他渠道一致的执行上下文。
+
+## hall 工作流
+- 从一条任务开始，第一轮会先留在 `讨论中`。
+- 如果你没有显式 `@` 某个人，hall 会尽量先收两条短回复，让第二个人承接第一人的上下文补缺口，而不是重写一遍。
+- 用 `安排后续顺序` 来决定谁先做、后面谁接、每一步交接给谁。
+- 保存顺序 **不会** 自动开始执行。
+- 队列排好后，结论卡会出现 `开始执行（...）`。
+- 进入执行后，每个人只做自己这一棒，并在同一条线程里显式 `@` 下一位交棒。
+- 只有最后一位执行者做完，或者人类明确要求先停下来评审时，才应该进入评审。
+- 一轮评审后，可以点 `继续讨论` 回到讨论态，再排下一轮顺序，然后从同一条线程继续开始。
 
 ## 5 分钟启动
 ```bash
@@ -77,6 +95,7 @@ cp .env.example .env
 npm run build
 npm test
 npm run smoke:ui
+npm run smoke:hall
 npm run dev:ui
 ```
 
@@ -103,12 +122,14 @@ npm run dev:ui
 ### 员工
 - 展示谁现在真的在工作，谁只是有排队中的任务。
 - 明确区分“正在执行”和“下一项”，避免把 backlog 误认为正在跑。
+- 如果员工卡片显示 `工作区未写明职责`，优先看 [FAQ 与最佳实践](docs/FAQ.md) 的第 1 条。
 - 最适合判断谁忙、谁闲、谁卡住、谁在等待。
 
 ### 协作
-- 独立展示智能体之间怎么交接、谁先接单、谁派给了谁、回复从哪条会话回来。
-- 既能看父会话与子会话的接力，也能看 `sessions_send` / `inter-session message` 这类已验证跨会话通信。
-- 最适合理解“这件事到底是谁转给了谁、现在卡在谁这里”。
+- hall-first 的多 agent 工作群：同一条线程里先讨论，再排顺序，再开始执行、交接和评审。
+- 运行时回复会直接回写到大厅时间线；需要更深证据时，再打开 linked room 看细节。
+- 预期风格更像真实员工群：讨论时短回复补缺口，执行时只认一个 owner，交接时显式 `@下一位`，最后才评审。
+- 最适合理解“这件事是谁在做、下一步交给谁、为什么现在能继续往前推进”。
 
 ### 记忆
 - 一个直接基于源文件的记忆工作台，用来查看和编辑每日记忆与长期记忆。
@@ -155,7 +176,8 @@ npm run dev:ui
 4. `npm run build`
 5. `npm test`
 6. `npm run smoke:ui`
-7. `npm run dev:ui`
+7. `npm run smoke:hall`
+8. `npm run dev:ui`
 
 ## 安装与上手
 
@@ -246,9 +268,9 @@ cp .env.example .env
 8. 不要假设任何固定 agent 名称。若 `openclaw.json` 可读，就以它为准。
 
 第二阶段：安装项目
-9. 确认当前目录是 control-center 仓库根目录。
+9. 确认当前目录是 control-center 仓库根目录。如果还没有 clone，先执行：`git clone https://github.com/TianyiDataScience/openclaw-control-center.git`
 10. 先确认仓库本体完整。
-11. 如果缺少 `src/runtime`、`src/ui` 或 `package.json`，不要继续安装，直接重新 clone 官方仓库。
+11. 如果缺少 `src/runtime`、`src/ui` 或 `package.json`，不要继续安装，重新 clone：`https://github.com/TianyiDataScience/openclaw-control-center.git`。
 12. 运行依赖安装。
 13. 如果 `.env` 不存在，就从 `.env.example` 创建；如果存在，就在保留安全默认值的前提下修正它。
 

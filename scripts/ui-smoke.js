@@ -82,10 +82,28 @@ async function checkPage(urlPath, keywords, label) {
   cleanup(1);
 }
 
+async function checkPageExcludes(urlPath, forbidden, label) {
+  const body = await fetch(urlPath);
+  const visible = body
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "");
+  const hit = forbidden.find((kw) => visible.includes(kw));
+  if (hit) {
+    console.error(`FAIL: ${label} — found forbidden marker "${hit}".`);
+    cleanup(1);
+  }
+}
+
 async function main() {
   await waitForUI();
-  await checkPage("/", ["OpenClaw", "Control Center", "usage", "lang="], "GET /");
+  await checkPage("/?section=overview&lang=en", ["OpenClaw", "Control Center", "usage", "lang="], "GET /?section=overview&lang=en");
   await checkPage("/docs?lang=en", ["Open document workbench", "Control Center", "Docs"], "GET /docs?lang=en");
+  await checkPage("/?section=hall-chat&lang=zh", ["协作大厅", "线程", "新任务"], "GET /?section=hall-chat&lang=zh");
+  await checkPageExcludes(
+    "/?section=hall-chat&lang=zh",
+    ["LOCAL_API_TOKEN", "language is not defined", "Manager handed the room to Reviewer", "[tool]", "thinking"],
+    "GET /?section=hall-chat&lang=zh excludes legacy leaks",
+  );
   console.log(`UI smoke passed on http://127.0.0.1:${PORT}`);
   cleanup(0);
 }

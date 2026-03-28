@@ -1,8 +1,13 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { open, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type {
+  AgentRunRequest,
+  AgentRunResponse,
+  AgentRunStreamHandlers,
+  AgentRunTransportContext,
   ApprovalsActionResponse,
   ApprovalsApproveRequest,
   ApprovalsGetResponse,
@@ -240,6 +245,145 @@ export class OpenClawLiveClient implements ToolClient {
     };
   }
 
+  async agentRun(request: AgentRunRequest): Promise<AgentRunResponse> {
+    const message = request.message.trim();
+    if (!message) {
+      throw new Error("agentRun requires a non-empty message.");
+    }
+
+    const args = ["agent"];
+    const sessionId = request.sessionId?.trim()
+      || (request.sessionKey?.trim() ? await this.resolveSessionIdByKey(request.sessionKey.trim()) : undefined);
+    if (sessionId) {
+      args.push("--session-id", sessionId);
+    } else {
+      const agentId = request.agentId?.trim();
+      if (!agentId) {
+        throw new Error("agentRun requires either agentId, sessionKey, or sessionId.");
+      }
+      args.push("--agent", agentId);
+    }
+
+    args.push("--message", message);
+    args.push("--thinking", normalizeThinkingLevel(request.thinking));
+    if (request.timeoutSeconds && Number.isFinite(request.timeoutSeconds) && request.timeoutSeconds > 0) {
+      args.push("--timeout", String(Math.trunc(request.timeoutSeconds)));
+    }
+    if (request.deliver) args.push("--deliver");
+    args.push("--json");
+
+    const transportOptions = buildAgentRunProcessOptions(request.context);
+    const rawJson = await runJson<Record<string, unknown>>(args, {
+      timeoutMs: (request.timeoutSeconds && Number.isFinite(request.timeoutSeconds) && request.timeoutSeconds > 0)
+        ? Math.max(5_000, Math.trunc(request.timeoutSeconds * 1_000))
+        : 20 * 60 * 1_000,
+      maxBuffer: 8 * 1024 * 1024,
+      cwd: transportOptions.cwd,
+      env: transportOptions.env,
+    });
+
+    const result = asObject(rawJson.result);
+    const meta = asObject(result?.meta);
+    const agentMeta = asObject(meta?.agentMeta);
+    const systemPromptReport = asObject(meta?.systemPromptReport);
+    const payloads = Array.isArray(result?.payloads) ? result?.payloads : [];
+    const text = payloads
+      .map((item) => {
+        const payload = asObject(item);
+        return asString(payload?.text)?.trim();
+      })
+      .filter((item): item is string => Boolean(item))
+      .join("\n\n")
+      .trim();
+    const sessionKey = asString(systemPromptReport?.sessionKey) ?? request.sessionKey?.trim();
+    const response: AgentRunResponse = {
+      ok: asString(rawJson.status) === "ok",
+      runId: asString(rawJson.runId),
+      status: asString(rawJson.status),
+      summary: asString(rawJson.summary),
+      text,
+      rawText: JSON.stringify(rawJson),
+      sessionId: asString(agentMeta?.sessionId) ?? sessionId,
+      sessionKey,
+      provider: asString(agentMeta?.provider) ?? asString(systemPromptReport?.provider),
+      model: asString(agentMeta?.model) ?? asString(systemPromptReport?.model),
+      rawJson,
+    };
+
+    if (sessionKey && response.sessionId) {
+      const cached = this.sessionCache.get(sessionKey) ?? {};
+      this.sessionCache.set(sessionKey, {
+        ...cached,
+        model: response.model ?? cached.model,
+      });
+    }
+
+    return response;
+  }
+
+  async agentRunStream(
+    request: AgentRunRequest,
+    handlers: AgentRunStreamHandlers = {},
+  ): Promise<AgentRunResponse> {
+    const message = request.message.trim();
+    if (!message) {
+      throw new Error("agentRunStream requires a non-empty message.");
+    }
+
+    const args = ["agent"];
+    const latestBeforeRun = await this.readLatestAgentSessionMarker(request.agentId?.trim());
+    const sessionId = request.sessionId?.trim()
+      || (request.sessionKey?.trim() ? await this.resolveSessionIdByKey(request.sessionKey.trim()) : undefined);
+    const agentId = request.agentId?.trim();
+    if (sessionId) {
+      args.push("--session-id", sessionId);
+    } else if (agentId) {
+      args.push("--agent", agentId);
+    } else {
+      throw new Error("agentRunStream requires either agentId, sessionKey, or sessionId.");
+    }
+
+    args.push("--message", message);
+    args.push("--thinking", normalizeThinkingLevel(request.thinking));
+    if (request.timeoutSeconds && Number.isFinite(request.timeoutSeconds) && request.timeoutSeconds > 0) {
+      args.push("--timeout", String(Math.trunc(request.timeoutSeconds)));
+    }
+    if (request.deliver) args.push("--deliver");
+
+    const timeoutMs = (request.timeoutSeconds && Number.isFinite(request.timeoutSeconds) && request.timeoutSeconds > 0)
+      ? Math.max(5_000, Math.trunc(request.timeoutSeconds * 1_000))
+      : 20 * 60 * 1_000;
+    const transportOptions = buildAgentRunProcessOptions(request.context);
+    const { stdout, stderr, code } = await runStreamingText(args, handlers, {
+      timeoutMs,
+      cwd: transportOptions.cwd,
+      env: transportOptions.env,
+    });
+    if (code !== 0) {
+      throw new Error(stderr.trim() || stdout.trim() || `openclaw agent exited with code ${code}`);
+    }
+
+    const text = sanitizeAgentCliOutput(stdout);
+    const sessionKey = request.sessionKey?.trim()
+      || await this.resolveSessionKeyAfterRun({
+        agentId,
+        beforeUpdatedAtMs: latestBeforeRun?.updatedAtMs,
+        beforeSessionKey: latestBeforeRun?.sessionKey,
+      });
+    const resolvedSessionId = sessionId
+      || (sessionKey ? await this.resolveSessionIdByKey(sessionKey) : undefined)
+      || latestBeforeRun?.sessionId;
+
+    return {
+      ok: true,
+      status: "ok",
+      text,
+      rawText: stdout,
+      sessionId: resolvedSessionId,
+      sessionKey,
+    };
+  }
+
   private async loadSessionsFromStores(): Promise<SessionsListResponse> {
     const openclawHome = resolveOpenClawHomePath();
     const agentsPath = join(openclawHome, "agents");
@@ -352,23 +496,111 @@ export class OpenClawLiveClient implements ToolClient {
     const catalog = await loadCurrentAgentCatalog();
     return new Set(catalog.entries.map((entry) => normalizeAgentKey(entry.agentId)));
   }
+
+  private async resolveSessionIdByKey(sessionKey: string): Promise<string | undefined> {
+    const sessions = (await this.sessionsList()).sessions ?? [];
+    return sessions.find((item) => item.sessionKey === sessionKey || item.key === sessionKey)?.sessionId;
+  }
+
+  private async readLatestAgentSessionMarker(
+    agentId: string | undefined,
+  ): Promise<{ sessionKey?: string; sessionId?: string; updatedAtMs?: number } | undefined> {
+    const normalizedAgentId = agentId?.trim();
+    if (!normalizedAgentId) return undefined;
+    const sessions = (await this.sessionsList()).sessions ?? [];
+    const match = sessions
+      .filter((item) => (item.agentId ?? extractAgentIdFromSessionKey(item.sessionKey ?? item.key)) === normalizedAgentId)
+      .sort((a, b) => (b.updatedAtMs ?? 0) - (a.updatedAtMs ?? 0))[0];
+    if (!match) return undefined;
+    return {
+      sessionKey: match.sessionKey ?? match.key,
+      sessionId: match.sessionId,
+      updatedAtMs: match.updatedAtMs,
+    };
+  }
+
+  private async resolveSessionKeyAfterRun(input: {
+    agentId?: string;
+    beforeUpdatedAtMs?: number;
+    beforeSessionKey?: string;
+  }): Promise<string | undefined> {
+    const normalizedAgentId = input.agentId?.trim();
+    if (!normalizedAgentId) return undefined;
+    const sessions = (await this.sessionsList()).sessions ?? [];
+    const candidates = sessions
+      .filter((item) => (item.agentId ?? extractAgentIdFromSessionKey(item.sessionKey ?? item.key)) === normalizedAgentId)
+      .sort((a, b) => (b.updatedAtMs ?? 0) - (a.updatedAtMs ?? 0));
+    const preferred = candidates.find((item) => (item.updatedAtMs ?? 0) > (input.beforeUpdatedAtMs ?? 0))
+      ?? candidates[0];
+    return preferred?.sessionKey ?? preferred?.key ?? input.beforeSessionKey ?? `agent:${normalizedAgentId}:main`;
+  }
 }
 
-async function runJson<T>(args: string[], options?: { timeoutMs?: number; maxBuffer?: number }): Promise<T> {
+async function runJson<T>(args: string[], options?: { timeoutMs?: number; maxBuffer?: number; cwd?: string; env?: NodeJS.ProcessEnv }): Promise<T> {
   const stdout = await runText(args, options);
   return JSON.parse(stdout) as T;
 }
 
 async function runText(
   args: string[],
-  options?: { timeoutMs?: number; maxBuffer?: number },
+  options?: { timeoutMs?: number; maxBuffer?: number; cwd?: string; env?: NodeJS.ProcessEnv },
 ): Promise<string> {
   const { stdout } = await execFileAsync("openclaw", args, {
     timeout: options?.timeoutMs ?? 20_000,
     maxBuffer: options?.maxBuffer ?? 2 * 1024 * 1024,
     shell: process.platform === "win32",
+    cwd: options?.cwd,
+    env: options?.env,
   });
   return stdout;
+}
+
+async function runStreamingText(
+  args: string[],
+  handlers: AgentRunStreamHandlers,
+  options?: { timeoutMs?: number; cwd?: string; env?: NodeJS.ProcessEnv },
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn("openclaw", args, {
+      shell: process.platform === "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+      cwd: options?.cwd,
+      env: options?.env,
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+    }, options?.timeoutMs ?? 20_000);
+
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      stdout += chunk;
+      handlers.onStdoutChunk?.(chunk);
+    });
+    child.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+      handlers.onStderrChunk?.(chunk);
+    });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        stdout,
+        stderr,
+        code: typeof code === "number" ? code : 0,
+      });
+    });
+  });
 }
 
 async function readSessionHistoryFromCli(
@@ -461,6 +693,85 @@ function asNumber(v: unknown): number | undefined {
 
 function asBoolean(v: unknown): boolean | undefined {
   return typeof v === "boolean" ? v : undefined;
+}
+
+function normalizeThinkingLevel(input: AgentRunRequest["thinking"]): NonNullable<AgentRunRequest["thinking"]> {
+  switch (input) {
+    case "off":
+    case "minimal":
+    case "low":
+    case "medium":
+    case "high":
+    case "xhigh":
+      return input;
+    default:
+      return "minimal";
+  }
+}
+
+function buildAgentRunProcessOptions(
+  context: AgentRunTransportContext | undefined,
+): { cwd?: string; env?: NodeJS.ProcessEnv } {
+  if (!context) return {};
+  const cwd = pickAgentRunWorkingDirectory(context);
+  const envEntries: Record<string, string> = {};
+  const surface = context.surface?.trim();
+  if (surface) envEntries.OPENCLAW_AGENT_SURFACE = surface;
+  const workspaceRoot = context.workspaceRoot?.trim();
+  if (workspaceRoot) envEntries.OPENCLAW_AGENT_WORKSPACE_ROOT = workspaceRoot;
+  const workdir = context.workdir?.trim();
+  if (workdir) envEntries.OPENCLAW_AGENT_WORKDIR = workdir;
+  if ((context.entryFiles?.length ?? 0) > 0) {
+    envEntries.OPENCLAW_AGENT_ENTRY_FILES_JSON = JSON.stringify(context.entryFiles);
+  }
+  if ((context.artifactRefs?.length ?? 0) > 0) {
+    envEntries.OPENCLAW_AGENT_ARTIFACT_REFS_JSON = JSON.stringify(context.artifactRefs);
+  }
+  if ((context.attachmentRefs?.length ?? 0) > 0) {
+    envEntries.OPENCLAW_AGENT_ATTACHMENT_REFS_JSON = JSON.stringify(context.attachmentRefs);
+  }
+  const env = Object.keys(envEntries).length > 0
+    ? {
+        ...process.env,
+        ...envEntries,
+      }
+    : undefined;
+  return { cwd, env };
+}
+
+function pickAgentRunWorkingDirectory(context: AgentRunTransportContext): string | undefined {
+  const candidates = [context.workdir, context.workspaceRoot]
+    .map((value) => value?.trim())
+    .filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function sanitizeAgentCliOutput(raw: string): string {
+  const withoutAnsi = raw
+    .replace(/\u001B\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\r/g, "\n");
+  const lines = withoutAnsi
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !line.startsWith("🦞 OpenClaw"))
+    .filter((line) => !line.startsWith("Registered plugin command:"))
+    .filter((line) => !/^Waiting for agent reply/i.test(line))
+    .filter((line) => !/^[◒◐◓◑◇│]+$/.test(line))
+    .filter((line) => !/^流式中$/i.test(line))
+    .filter((line) => !/^\[tool(?:[^\]]*)?\]/i.test(line))
+    .filter((line) => !/^thinking\b/i.test(line))
+    .filter((line) => !/^Inspecting\b/i.test(line))
+    .filter((line) => !/^Checking\b/i.test(line))
+    .filter((line) => !/^It seems\b/i.test(line))
+    .filter((line) => !/^I should\b/i.test(line))
+    .filter((line) => !/^I think\b/i.test(line))
+    .filter((line) => !/^Let's\b/i.test(line))
+    .filter((line) => !/^(import|export)\s+/i.test(line));
+  return lines.join("\n").trim();
 }
 
 function asObject(v: unknown): Record<string, unknown> | undefined {

@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
@@ -12,6 +12,7 @@ import {
   LOCAL_API_TOKEN,
   LOCAL_TOKEN_AUTH_REQUIRED,
   LOCAL_TOKEN_HEADER,
+  OPENCLAW_CONTROL_UI_URL,
   POLLING_INTERVALS_MS,
   READONLY_MODE,
 } from "../config";
@@ -54,6 +55,19 @@ import {
 import { appendOperationAudit } from "../runtime/operation-audit";
 import { ApprovalActionService } from "../runtime/approval-action-service";
 import { buildActionQueueLinks } from "../runtime/action-queue-links";
+import {
+  ChatStoreValidationError,
+  createChatRoom,
+  getChatRoom,
+  getChatRoomByTask,
+  listChatMessages,
+  listChatRooms,
+  loadChatMessageStore,
+  loadChatRoomStore,
+  updateChatRoom,
+} from "../runtime/chat-store";
+import { getChatRoomSummary, loadChatSummaryStore } from "../runtime/chat-summary-store";
+import { getHallTaskCard, getHallTaskCardByTask, loadCollaborationTaskCardStore } from "../runtime/collaboration-hall-store";
 import { loadReplayIndex, writeExportSnapshot } from "../runtime/replay-index";
 import { buildNotificationPreview, loadNotificationPolicy } from "../runtime/notification-policy";
 import {
@@ -79,6 +93,33 @@ import { computeProjectSummaries } from "../runtime/project-summary";
 import { computeTasksSummary } from "../runtime/task-summary";
 import { readTaskHeartbeatRuns, runTaskHeartbeat, runtimeTaskHeartbeatGate } from "../runtime/task-heartbeat";
 import {
+  assignRoomExecution,
+  postRoomMessage,
+  readRoomDetail,
+  recordRoomHandoff,
+  refreshRoomSummary,
+  submitRoomReview,
+} from "../runtime/room-orchestrator";
+import {
+  assignHallTaskExecution,
+  archiveHallTaskThread,
+  createHallTaskFromOperatorRequest,
+  deleteHallTaskThread,
+  postHallMessage,
+  readCollaborationHall,
+  readCollaborationHallTaskDetail,
+  recordHallTaskHandoff,
+  setHallTaskExecutionOrder,
+  stopHallTaskExecution,
+  submitHallTaskReview,
+} from "../runtime/collaboration-hall-orchestrator";
+import { openHallEventStream, openRoomEventStream } from "../runtime/collaboration-stream";
+import {
+  listTaskRoomBridgeEvents,
+  loadTaskRoomBridgeStore,
+  publishTaskRoomBridgeEvent,
+} from "../runtime/task-room-bridge";
+import {
   UI_QUICK_FILTERS,
   isUiLanguage,
   isUiQuickFilter,
@@ -94,6 +135,7 @@ import {
   createTask,
   listTasks,
   loadTaskStore,
+  patchTask,
   updateTaskStatus,
 } from "../runtime/task-store";
 import {
@@ -108,6 +150,8 @@ import {
   type SessionHistoryMessage,
   type SessionInterSessionSignal,
 } from "../runtime/session-conversations";
+import { renderCollaborationHall, renderCollaborationHallClientScript } from "./collaboration-hall";
+import { renderTaskRoomClientScript, renderTaskRoomWorkbench, renderTaskRoomWorkbenchForSmoke } from "./task-room-workbench";
 import { loadBestEffortAgentRoster, type AgentRosterEntry, type AgentRosterSnapshot } from "../runtime/agent-roster";
 import {
   loadBestEffortOfficeSessionPresence,
@@ -123,6 +167,9 @@ import {
   type AvatarMode,
 } from "../runtime/avatar-preferences";
 import type {
+  ChatMessage,
+  ChatRoom,
+  HallTaskCard,
   AgentRunState,
   BudgetEvaluation,
   BudgetMetricEvaluation,
@@ -132,6 +179,8 @@ import type {
   ReadinessCategoryScore,
   ProjectState,
   ReadModelSnapshot,
+  RoomParticipantRole,
+  RoomStage,
   TaskListItem,
   TaskState,
 } from "../types";
@@ -185,6 +234,7 @@ const OPENCLAW_WORKSPACE_ROOT = resolveOpenClawWorkspaceRoot({
   openclawHomeDir: OPENCLAW_HOME_DIR,
   configPath: OPENCLAW_CONFIG_PATH,
 });
+const CONTROL_CENTER_ROOT = resolveControlCenterRoot(process.cwd());
 const WORKSPACE_EDITABLE_SKIP_DIRS = new Set(["node_modules", ".git", "dist", "coverage"]);
 const WORKSPACE_EDITABLE_EXTENSIONS = new Set([".md", ".markdown"]);
 const MEMORY_EDITABLE_EXTENSIONS = new Set([".md", ".markdown", ".txt"]);
@@ -230,6 +280,7 @@ const DASHBOARD_SECTIONS = [
   "calendar",
   "team",
   "collaboration",
+  "hall-chat",
   "memory",
   "docs",
   "usage-cost",
@@ -331,6 +382,7 @@ const DASHBOARD_SECTION_LINKS_EN: DashboardSectionLink[] = [
   { key: "usage-cost", label: "Usage", blurb: "Budget and quota" },
   { key: "team", label: "Staff", blurb: "Mission, staff and assignments" },
   { key: "collaboration", label: "Collaboration", blurb: "Agent handoffs and teamwork" },
+  { key: "hall-chat", label: "Hall Chat", blurb: "Shared agent group chat" },
   { key: "memory", label: "Memory", blurb: "Daily and long-term memories" },
   { key: "docs", label: "Documents", blurb: "Main and active agent core docs" },
   { key: "projects-tasks", label: "Tasks", blurb: "Board, schedule and activity" },
@@ -476,6 +528,8 @@ interface DashboardOptions {
   usageView: UsageView;
   preferencesPath: string;
   search: DashboardSearchQuery;
+  selectedRoomId?: string;
+  selectedTaskCardId?: string;
 }
 
 interface DashboardSectionLink {
@@ -915,8 +969,45 @@ interface LinkageGraph {
   };
 }
 
-export function startUiServer(port: number, toolClient: ToolClient): Server {
+interface StartUiServerOptions {
+  localTokenAuthRequired?: boolean;
+  localApiToken?: string;
+}
+
+export function startUiServer(port: number, toolClient: ToolClient, options: StartUiServerOptions = {}): Server {
   const approvalActions = new ApprovalActionService(toolClient);
+  const localTokenGateRequired = options.localTokenAuthRequired ?? LOCAL_TOKEN_AUTH_REQUIRED;
+  const localApiToken = options.localApiToken ?? LOCAL_API_TOKEN;
+  const assertMutationAuthorized = (
+    req: IncomingMessage,
+    routeLabel: string,
+    explicitToken?: string | null,
+  ): void => {
+    assertMutationAuthorizedWithConfig(
+      req,
+      routeLabel,
+      {
+        gateRequired: localTokenGateRequired,
+        configuredToken: localApiToken,
+      },
+      explicitToken,
+    );
+  };
+  const assertCollaborationMutationAuthorized = (
+    req: IncomingMessage,
+    routeLabel: string,
+    explicitToken?: string | null,
+  ): void => {
+    assertMutationAuthorizedWithConfig(
+      req,
+      routeLabel,
+      {
+        gateRequired: false,
+        configuredToken: localApiToken,
+      },
+      explicitToken,
+    );
+  };
 
   const server = createServer(async (req, res) => {
     const method = req.method ?? "GET";
@@ -943,6 +1034,8 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
         const compactStatusStrip = resolveCompactStatusStrip(url.searchParams, prefs.preferences.compactStatusStrip);
         const usageView = resolveUsageView(url.searchParams);
         const search = resolveDashboardSearchQuery(url.searchParams);
+        const selectedRoomId = normalizeQueryString(url.searchParams.get("roomId"), "roomId", 160, true);
+        const selectedTaskCardId = normalizeQueryString(url.searchParams.get("taskCardId"), "taskCardId", 180, true);
         const hasTaskFilterQuery = hasAnyQueryKey(url.searchParams, ["quick", "status", "owner", "project"]);
 
         if (section === "projects-tasks" && !hasTaskFilterQuery) {
@@ -975,6 +1068,8 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
           usageView,
           preferencesPath: prefs.path,
           search,
+          selectedRoomId,
+          selectedTaskCardId,
         });
         return writeText(res, 200, html, "text/html; charset=utf-8");
       }
@@ -1256,10 +1351,16 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
         return writeJson(res, 200, { ok: true, path: saved.path, preferences: saved.preferences, issues: saved.issues });
       }
 
-      if (method === "GET" && path.startsWith("/avatars/")) {
+      if ((method === "GET" || method === "HEAD") && path.startsWith("/avatars/")) {
         assertAllowedQueryParams(url.searchParams, [], true);
         const fileName = decodeURIComponent(path.slice("/avatars/".length));
-        return await serveAvatarFile(res, fileName);
+        return await serveAvatarFile(res, fileName, method === "HEAD");
+      }
+
+      if ((method === "GET" || method === "HEAD") && path.startsWith("/hall-avatars/")) {
+        assertAllowedQueryParams(url.searchParams, [], true);
+        const fileName = decodeURIComponent(path.slice("/hall-avatars/".length));
+        return await serveHallAvatarFile(res, fileName, method === "HEAD");
       }
 
       if (method === "GET" && path === "/api/search/tasks") {
@@ -1565,7 +1666,62 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
         assertMutationAuthorized(req, "/api/tasks");
         assertJsonContentType(req);
         const payload = expectObject(await readJsonBody(req), "create task payload");
+        const autoCreateRoom =
+          payload.autoCreateRoom === true || typeof payload.roomTitle === "string" || typeof payload.roomId === "string";
+
+        if (autoCreateRoom) {
+          const rooms = await loadChatRoomStore();
+          if (getChatRoomByTask(rooms, String(payload.taskId ?? ""), String(payload.projectId ?? ""))) {
+            throw new ChatStoreValidationError(
+              `task '${String(payload.projectId ?? "")}:${String(payload.taskId ?? "")}' already has a primary room.`,
+              ["taskId"],
+              409,
+            );
+          }
+          if (typeof payload.roomId === "string" && getChatRoom(rooms, payload.roomId)) {
+            throw new ChatStoreValidationError(`roomId '${payload.roomId}' already exists.`, ["roomId"], 409);
+          }
+        }
+
         const created = await createTask(payload);
+        let roomResponse:
+          | {
+              room: Awaited<ReturnType<typeof createChatRoom>>["room"];
+              summary: Awaited<ReturnType<typeof refreshRoomSummary>>;
+            }
+          | undefined;
+        if (autoCreateRoom) {
+          const createdRoom = await createChatRoom({
+            projectId: created.task.projectId,
+            taskId: created.task.taskId,
+            roomId: typeof payload.roomId === "string" ? payload.roomId : undefined,
+            title: typeof payload.roomTitle === "string" ? payload.roomTitle : created.task.title,
+          });
+          const patched = await patchTask({
+            taskId: created.task.taskId,
+            projectId: created.task.projectId,
+            roomId: createdRoom.room.roomId,
+          });
+          roomResponse = {
+            room: createdRoom.room,
+            summary: await refreshRoomSummary(createdRoom.room.roomId),
+          };
+          const bridge = await safePublishTaskRoomBridgeEvent({
+            type: "room_created",
+            room: createdRoom.room,
+            task: patched.task,
+            requestId,
+            note: "Room auto-created during task creation.",
+          });
+          return writeJson(res, 201, {
+            ok: true,
+            ...created,
+            task: patched.task,
+            room: roomResponse.room,
+            roomSummary: roomResponse.summary,
+            bridge,
+          });
+        }
         return writeJson(res, 201, { ok: true, ...created });
       }
 
@@ -1580,6 +1736,736 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
           projectId: payload.projectId,
         });
         return writeJson(res, 200, { ok: true, ...updated });
+      }
+
+      if (method === "GET" && path === "/api/hall") {
+        const hall = await readCollaborationHall();
+        return writeJson(res, 200, {
+          ok: true,
+          hall: hall.hall,
+          summary: hall.hallSummary,
+          participants: hall.participants,
+          count: hall.taskCards.length,
+          taskCards: hall.taskCards.map((card) => ({
+            ...card,
+            summary: hall.taskSummaries.find((summary) => summary.taskCardId === card.taskCardId),
+          })),
+          messages: hall.messages.slice(-180),
+        });
+      }
+
+      if (method === "GET" && path === "/api/hall/events") {
+        assertAllowedQueryParams(url.searchParams, ["hallId"], true);
+        const hallId = normalizeQueryString(url.searchParams.get("hallId"), "hallId", 120, true) ?? "main";
+        openHallEventStream(req, res, hallId);
+        return;
+      }
+
+      if (method === "GET" && path === "/api/hall/messages") {
+        assertAllowedQueryParams(url.searchParams, ["taskCardId", "taskId", "projectId", "limit"], true);
+        const hall = await readCollaborationHall();
+        const taskCardId = normalizeQueryString(url.searchParams.get("taskCardId"), "taskCardId", 180, true);
+        const taskId = normalizeQueryString(url.searchParams.get("taskId"), "taskId", 120, true);
+        const projectId = normalizeQueryString(url.searchParams.get("projectId"), "projectId", 120, true);
+        const limit = readPositiveIntQuery(url.searchParams.get("limit"), "limit", 120, true, 500);
+        const messages = hall.messages
+          .filter((message) => !taskCardId || message.taskCardId === taskCardId)
+          .filter((message) => !taskId || message.taskId === taskId)
+          .filter((message) => !projectId || message.projectId === projectId)
+          .slice(-limit);
+        return writeJson(res, 200, {
+          ok: true,
+          hall: hall.hall,
+          count: messages.length,
+          messages,
+        });
+      }
+
+      if (method === "POST" && path === "/api/hall/messages") {
+        assertCollaborationMutationAuthorized(req, "/api/hall/messages");
+        assertJsonContentType(req);
+        const payload = expectObject(await readJsonBody(req), "create hall message payload");
+        const result = await postHallMessage({
+          hallId: optionalBoundedString(payload.hallId, "hallId", 120),
+          taskCardId: optionalBoundedString(payload.taskCardId, "taskCardId", 180),
+          projectId: optionalBoundedString(payload.projectId, "projectId", 120),
+          taskId: optionalBoundedString(payload.taskId, "taskId", 120),
+          content: requiredBoundedString(payload.content, "content", 4000),
+          authorParticipantId: optionalBoundedString(payload.authorParticipantId, "authorParticipantId", 160),
+          authorLabel: optionalBoundedString(payload.authorLabel, "authorLabel", 120),
+        }, { toolClient });
+        await appendOperationAudit({
+          action: "hall_task_message",
+          source: "api",
+          ok: true,
+          requestId,
+          detail: `posted hall message${result.taskCard ? ` for ${result.taskCard.projectId}:${result.taskCard.taskId}` : ""}`,
+          metadata: {
+            taskCardId: result.taskCard?.taskCardId,
+            generatedMessages: result.generatedMessages.length,
+          },
+        });
+        return writeJson(res, 201, {
+          ok: true,
+          ...result,
+        });
+      }
+
+      if (method === "GET" && path === "/api/hall/tasks") {
+        assertAllowedQueryParams(url.searchParams, ["stage"], true);
+        const hall = await readCollaborationHall();
+        const stage = normalizeHallTaskStageQuery(url.searchParams.get("stage"));
+        const taskCards = hall.taskCards.filter((card) => !stage || card.stage === stage);
+        return writeJson(res, 200, {
+          ok: true,
+          hall: hall.hall,
+          count: taskCards.length,
+          taskCards: taskCards.map((card) => ({
+            ...card,
+            summary: hall.taskSummaries.find((summary) => summary.taskCardId === card.taskCardId),
+          })),
+        });
+      }
+
+      if (method === "POST" && path === "/api/hall/tasks") {
+        assertCollaborationMutationAuthorized(req, "/api/hall/tasks");
+        assertJsonContentType(req);
+        const payload = expectObject(await readJsonBody(req), "create hall task payload");
+        const result = await createHallTaskFromOperatorRequest({
+          hallId: optionalBoundedString(payload.hallId, "hallId", 120),
+          projectId: optionalBoundedString(payload.projectId, "projectId", 120),
+          taskId: optionalBoundedString(payload.taskId, "taskId", 120),
+          title: optionalBoundedString(payload.title, "title", 180),
+          content: requiredBoundedString(payload.content, "content", 4000),
+          authorParticipantId: optionalBoundedString(payload.authorParticipantId, "authorParticipantId", 160),
+          authorLabel: optionalBoundedString(payload.authorLabel, "authorLabel", 120),
+        }, { toolClient });
+        return writeJson(res, 201, {
+          ok: true,
+          ...result,
+        });
+      }
+
+      if (method === "GET" && path.startsWith("/api/hall/tasks/") && !path.endsWith("/assign") && !path.endsWith("/review") && !path.endsWith("/handoff") && !path.endsWith("/execution-order") && !path.endsWith("/stop") && !path.endsWith("/archive") && !path.endsWith("/delete") && !path.endsWith("/evidence")) {
+        const taskId = decodeRouteParam(path, /^\/api\/hall\/tasks\/([^/]+)$/, "taskId");
+        assertAllowedQueryParams(url.searchParams, ["projectId", "taskCardId"], true);
+        const projectId = normalizeQueryString(url.searchParams.get("projectId"), "projectId", 120, true);
+        const taskCardId = normalizeQueryString(url.searchParams.get("taskCardId"), "taskCardId", 180, true);
+        const taskCardStore = await loadCollaborationTaskCardStore();
+        const taskCard = resolveHallTaskCardRequest(taskCardStore, {
+          taskId,
+          projectId,
+          taskCardId,
+        });
+        const detail = await readCollaborationHallTaskDetail(taskCard.taskCardId);
+        return writeJson(res, 200, {
+          ok: true,
+          hall: detail.hall,
+          hallSummary: detail.hallSummary,
+          taskCard: detail.taskCard,
+          taskSummary: detail.taskSummary,
+          task: detail.task,
+          messages: detail.messages,
+        });
+      }
+
+      if (method === "POST" && path.startsWith("/api/hall/tasks/") && path.endsWith("/assign")) {
+        assertCollaborationMutationAuthorized(req, "/api/hall/tasks/:taskId/assign");
+        assertJsonContentType(req);
+        const taskId = decodeRouteParam(path, /^\/api\/hall\/tasks\/([^/]+)\/assign$/, "taskId");
+        const payload = expectObject(await readJsonBody(req), "assign hall task payload");
+        const projectId = optionalBoundedString(payload.projectId, "projectId", 120);
+        const taskCardId = optionalBoundedString(payload.taskCardId, "taskCardId", 180);
+        const taskCardStore = await loadCollaborationTaskCardStore();
+        const taskCard = resolveHallTaskCardRequest(taskCardStore, {
+          taskId,
+          projectId,
+          taskCardId,
+        });
+        const result = await assignHallTaskExecution({
+          taskCardId: taskCard.taskCardId,
+          ownerParticipantId: optionalBoundedString(payload.participantId, "participantId", 160),
+          note: optionalBoundedString(payload.note, "note", 320),
+        }, { toolClient });
+        return writeJson(res, 200, { ok: true, ...result });
+      }
+
+      if (method === "POST" && path.startsWith("/api/hall/tasks/") && path.endsWith("/review")) {
+        assertCollaborationMutationAuthorized(req, "/api/hall/tasks/:taskId/review");
+        assertJsonContentType(req);
+        const taskId = decodeRouteParam(path, /^\/api\/hall\/tasks\/([^/]+)\/review$/, "taskId");
+        const payload = expectObject(await readJsonBody(req), "review hall task payload");
+        const projectId = optionalBoundedString(payload.projectId, "projectId", 120);
+        const taskCardId = optionalBoundedString(payload.taskCardId, "taskCardId", 180);
+        const outcome = payload.outcome === "approved" || payload.outcome === "rejected" ? payload.outcome : undefined;
+        if (!outcome) {
+          throw new RequestValidationError("outcome must be 'approved' or 'rejected'.", 400);
+        }
+        const taskCardStore = await loadCollaborationTaskCardStore();
+        const taskCard = resolveHallTaskCardRequest(taskCardStore, {
+          taskId,
+          projectId,
+          taskCardId,
+        });
+        const result = await submitHallTaskReview({
+          taskCardId: taskCard.taskCardId,
+          outcome,
+          note: optionalBoundedString(payload.note, "note", 320),
+          blockTask: payload.blockTask === true,
+        });
+        return writeJson(res, 200, { ok: true, ...result });
+      }
+
+      if (method === "POST" && path.startsWith("/api/hall/tasks/") && path.endsWith("/handoff")) {
+        assertCollaborationMutationAuthorized(req, "/api/hall/tasks/:taskId/handoff");
+        assertJsonContentType(req);
+        const taskId = decodeRouteParam(path, /^\/api\/hall\/tasks\/([^/]+)\/handoff$/, "taskId");
+        const payload = expectObject(await readJsonBody(req), "handoff hall task payload");
+        const projectId = optionalBoundedString(payload.projectId, "projectId", 120);
+        const taskCardId = optionalBoundedString(payload.taskCardId, "taskCardId", 180);
+        const toParticipantId = requiredBoundedString(payload.toParticipantId, "toParticipantId", 160);
+        const taskCardStore = await loadCollaborationTaskCardStore();
+        const taskCard = resolveHallTaskCardRequest(taskCardStore, {
+          taskId,
+          projectId,
+          taskCardId,
+        });
+        const handoffPayload = expectObject(payload.handoff, "structured handoff payload");
+        const result = await recordHallTaskHandoff({
+          taskCardId: taskCard.taskCardId,
+          fromParticipantId:
+            optionalBoundedString(payload.fromParticipantId, "fromParticipantId", 160)
+            ?? taskCard.currentOwnerParticipantId
+            ?? "operator",
+          toParticipantId,
+          handoff: {
+            goal: requiredBoundedString(handoffPayload.goal, "handoff.goal", 240),
+            currentResult: requiredBoundedString(handoffPayload.currentResult, "handoff.currentResult", 500),
+            doneWhen: requiredBoundedString(handoffPayload.doneWhen, "handoff.doneWhen", 240),
+            blockers: Array.isArray(handoffPayload.blockers)
+              ? handoffPayload.blockers.filter((item): item is string => typeof item === "string")
+              : [],
+            nextOwner: optionalBoundedString(handoffPayload.nextOwner, "handoff.nextOwner", 160) ?? toParticipantId,
+            requiresInputFrom: Array.isArray(handoffPayload.requiresInputFrom)
+              ? handoffPayload.requiresInputFrom.filter((item): item is string => typeof item === "string")
+              : [],
+          },
+        }, { toolClient });
+        return writeJson(res, 200, { ok: true, ...result });
+      }
+
+      if (method === "POST" && path.startsWith("/api/hall/tasks/") && path.endsWith("/execution-order")) {
+        assertCollaborationMutationAuthorized(req, "/api/hall/tasks/:taskId/execution-order");
+        assertJsonContentType(req);
+        const taskId = decodeRouteParam(path, /^\/api\/hall\/tasks\/([^/]+)\/execution-order$/, "taskId");
+        const payload = expectObject(await readJsonBody(req), "hall execution order payload");
+        const projectId = optionalBoundedString(payload.projectId, "projectId", 120);
+        const taskCardId = optionalBoundedString(payload.taskCardId, "taskCardId", 180);
+        const taskCardStore = await loadCollaborationTaskCardStore();
+        const taskCard = resolveHallTaskCardRequest(taskCardStore, {
+          taskId,
+          projectId,
+          taskCardId,
+        });
+        const participantIds = Array.isArray(payload.participantIds)
+          ? payload.participantIds.filter((item): item is string => typeof item === "string")
+          : [];
+        const executionItems = Array.isArray(payload.executionItems)
+          ? payload.executionItems
+              .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+              .map((item) => ({
+                itemId: optionalBoundedString(typeof item.itemId === "string" ? item.itemId : undefined, "executionItems[].itemId", 180) ?? crypto.randomUUID(),
+                participantId: requiredBoundedString(typeof item.participantId === "string" ? item.participantId : undefined, "executionItems[].participantId", 160),
+                task: requiredBoundedString(typeof item.task === "string" ? item.task : undefined, "executionItems[].task", 400),
+                handoffToParticipantId: optionalBoundedString(typeof item.handoffToParticipantId === "string" ? item.handoffToParticipantId : undefined, "executionItems[].handoffToParticipantId", 160),
+                handoffWhen: optionalBoundedString(typeof item.handoffWhen === "string" ? item.handoffWhen : undefined, "executionItems[].handoffWhen", 240),
+              }))
+          : undefined;
+        const result = await setHallTaskExecutionOrder({
+          taskCardId: taskCard.taskCardId,
+          participantIds,
+          executionItems,
+          note: optionalBoundedString(payload.note, "note", 320),
+        });
+        return writeJson(res, 200, { ok: true, ...result });
+      }
+
+      if (method === "POST" && path.startsWith("/api/hall/tasks/") && path.endsWith("/stop")) {
+        assertCollaborationMutationAuthorized(req, "/api/hall/tasks/:taskId/stop");
+        assertJsonContentType(req);
+        const taskId = decodeRouteParam(path, /^\/api\/hall\/tasks\/([^/]+)\/stop$/, "taskId");
+        const payload = expectObject(await readJsonBody(req), "hall stop payload");
+        const projectId = optionalBoundedString(payload.projectId, "projectId", 120);
+        const taskCardId = optionalBoundedString(payload.taskCardId, "taskCardId", 180);
+        const taskCardStore = await loadCollaborationTaskCardStore();
+        const taskCard = resolveHallTaskCardRequest(taskCardStore, {
+          taskId,
+          projectId,
+          taskCardId,
+        });
+        const result = await stopHallTaskExecution({
+          taskCardId: taskCard.taskCardId,
+          note: optionalBoundedString(payload.note, "note", 320),
+        });
+        return writeJson(res, 200, { ok: true, ...result });
+      }
+
+      if (method === "POST" && path.startsWith("/api/hall/tasks/") && path.endsWith("/archive")) {
+        assertCollaborationMutationAuthorized(req, "/api/hall/tasks/:taskId/archive");
+        assertJsonContentType(req);
+        const taskId = decodeRouteParam(path, /^\/api\/hall\/tasks\/([^/]+)\/archive$/, "taskId");
+        const payload = expectObject(await readJsonBody(req), "hall archive payload");
+        const projectId = optionalBoundedString(payload.projectId, "projectId", 120);
+        const taskCardId = optionalBoundedString(payload.taskCardId, "taskCardId", 180);
+        const taskCardStore = await loadCollaborationTaskCardStore();
+        const taskCard = resolveHallTaskCardRequest(taskCardStore, {
+          taskId,
+          projectId,
+          taskCardId,
+        });
+        const result = await archiveHallTaskThread({
+          taskCardId: taskCard.taskCardId,
+          archivedByParticipantId: optionalBoundedString(payload.archivedByParticipantId, "archivedByParticipantId", 160),
+          archivedByLabel: optionalBoundedString(payload.archivedByLabel, "archivedByLabel", 120),
+        });
+        return writeJson(res, 200, { ok: true, ...result });
+      }
+
+      if (method === "POST" && path.startsWith("/api/hall/tasks/") && path.endsWith("/delete")) {
+        assertCollaborationMutationAuthorized(req, "/api/hall/tasks/:taskId/delete");
+        assertJsonContentType(req);
+        const taskId = decodeRouteParam(path, /^\/api\/hall\/tasks\/([^/]+)\/delete$/, "taskId");
+        const payload = expectObject(await readJsonBody(req), "hall delete payload");
+        const projectId = optionalBoundedString(payload.projectId, "projectId", 120);
+        const taskCardId = optionalBoundedString(payload.taskCardId, "taskCardId", 180);
+        const taskCardStore = await loadCollaborationTaskCardStore();
+        const taskCard = resolveHallTaskCardRequest(taskCardStore, {
+          taskId,
+          projectId,
+          taskCardId,
+        });
+        const result = await deleteHallTaskThread({
+          taskCardId: taskCard.taskCardId,
+        });
+        return writeJson(res, 200, { ok: true, ...result });
+      }
+
+      if (method === "GET" && path.startsWith("/api/hall/tasks/") && path.endsWith("/evidence")) {
+        const taskId = decodeRouteParam(path, /^\/api\/hall\/tasks\/([^/]+)\/evidence$/, "taskId");
+        assertAllowedQueryParams(url.searchParams, ["projectId", "taskCardId", "historyLimit"], true);
+        const projectId = normalizeQueryString(url.searchParams.get("projectId"), "projectId", 120, true);
+        const taskCardId = normalizeQueryString(url.searchParams.get("taskCardId"), "taskCardId", 180, true);
+        const historyLimit = readPositiveIntQuery(url.searchParams.get("historyLimit"), "historyLimit", 25, true, 200);
+        const taskCardStore = await loadCollaborationTaskCardStore();
+        const taskCard = resolveHallTaskCardRequest(taskCardStore, {
+          taskId,
+          projectId,
+          taskCardId,
+        });
+        if (!taskCard.roomId) {
+          return writeJson(res, 200, {
+            ok: true,
+            taskCard,
+            room: null,
+            summary: null,
+            storedMessages: [],
+            evidenceMessages: [],
+          });
+        }
+        const detail = await readRoomDetail(taskCard.roomId);
+        const evidenceMessages = await buildRoomEvidenceMessages(detail.room, historyLimit, toolClient);
+        return writeJson(res, 200, {
+          ok: true,
+          taskCard,
+          room: detail.room,
+          summary: detail.summary,
+          storedMessages: detail.messages,
+          evidenceMessages,
+        });
+      }
+
+      if (method === "GET" && path === "/api/rooms") {
+        assertAllowedQueryParams(url.searchParams, ["projectId", "taskId", "stage", "q"], true);
+        const [roomStore, summaryStore] = await Promise.all([loadChatRoomStore(), loadChatSummaryStore()]);
+        const projectId = normalizeQueryString(url.searchParams.get("projectId"), "projectId", 100, true);
+        const taskId = normalizeQueryString(url.searchParams.get("taskId"), "taskId", 120, true);
+        const stage = normalizeRoomStageQuery(url.searchParams.get("stage"));
+        const q = normalizeQueryString(url.searchParams.get("q"), "q", 180, true)?.toLowerCase();
+        const rooms = listChatRooms(roomStore).filter((room) => {
+          if (projectId && room.projectId !== projectId) return false;
+          if (taskId && room.taskId !== taskId) return false;
+          if (stage && room.stage !== stage) return false;
+          if (!q) return true;
+          const haystack = [
+            room.roomId,
+            room.projectId,
+            room.taskId,
+            room.title,
+            room.proposal,
+            room.decision,
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase();
+          return haystack.includes(q);
+        });
+
+        return writeJson(res, 200, {
+          ok: true,
+          updatedAt: roomStore.updatedAt,
+          count: rooms.length,
+          rooms: rooms.map((room) => ({
+            ...room,
+            summary: getChatRoomSummary(summaryStore, room.roomId),
+          })),
+        });
+      }
+
+      if (method === "POST" && path === "/api/rooms") {
+        assertCollaborationMutationAuthorized(req, "/api/rooms");
+        assertJsonContentType(req);
+        const payload = expectObject(await readJsonBody(req), "create room payload");
+        const taskStore = await loadTaskStore();
+        const linkedTask = taskStore.tasks.find(
+          (task) => task.projectId === String(payload.projectId ?? "") && task.taskId === String(payload.taskId ?? ""),
+        );
+        if (!linkedTask) {
+          throw new ChatStoreValidationError(
+            `task '${String(payload.projectId ?? "")}:${String(payload.taskId ?? "")}' was not found.`,
+            ["taskId"],
+            404,
+          );
+        }
+        const created = await createChatRoom(payload);
+        const patchedTask = await patchTask({
+          taskId: created.room.taskId,
+          projectId: created.room.projectId,
+          roomId: created.room.roomId,
+        });
+        const summary = await refreshRoomSummary(created.room.roomId);
+        const bridge = await safePublishTaskRoomBridgeEvent({
+          type: "room_created",
+          room: created.room,
+          task: patchedTask.task,
+          requestId,
+          note: "Room created via room API.",
+        });
+        await appendOperationAudit({
+          action: "task_room_create",
+          source: "api",
+          ok: true,
+          requestId,
+          detail: `created room ${created.room.roomId} for ${created.room.projectId}:${created.room.taskId}`,
+          metadata: {
+            roomId: created.room.roomId,
+            projectId: created.room.projectId,
+            taskId: created.room.taskId,
+            stage: created.room.stage,
+          },
+        });
+        return writeJson(res, 201, {
+          ok: true,
+          ...created,
+          room: created.room,
+          task: patchedTask.task,
+          summary,
+          bridge,
+        });
+      }
+
+      if (method === "GET" && path.startsWith("/api/rooms/") && path.endsWith("/messages")) {
+        const roomId = decodeRouteParam(path, /^\/api\/rooms\/([^/]+)\/messages$/, "roomId");
+        assertAllowedQueryParams(url.searchParams, ["limit", "historyLimit"], true);
+        const limit = readPositiveIntQuery(url.searchParams.get("limit"), "limit", 200, true, 1000);
+        const historyLimit = readPositiveIntQuery(url.searchParams.get("historyLimit"), "historyLimit", 25, true, 200);
+        const detail = await readRoomDetail(roomId);
+        const evidenceMessages = await buildRoomEvidenceMessages(detail.room, historyLimit, toolClient);
+        const mergedMessages = [...detail.messages, ...evidenceMessages]
+          .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
+          .slice(-limit);
+        return writeJson(res, 200, {
+          ok: true,
+          room: detail.room,
+          summary: detail.summary,
+          count: mergedMessages.length,
+          storedCount: detail.messages.length,
+          evidenceCount: evidenceMessages.length,
+          messages: mergedMessages,
+        });
+      }
+
+      if (method === "GET" && path.startsWith("/api/rooms/") && path.endsWith("/events")) {
+        const roomId = decodeRouteParam(path, /^\/api\/rooms\/([^/]+)\/events$/, "roomId");
+        openRoomEventStream(req, res, roomId);
+        return;
+      }
+
+      if (method === "POST" && path.startsWith("/api/rooms/") && path.endsWith("/messages")) {
+        assertCollaborationMutationAuthorized(req, "/api/rooms/:roomId/messages");
+        assertJsonContentType(req);
+        const roomId = decodeRouteParam(path, /^\/api\/rooms\/([^/]+)\/messages$/, "roomId");
+        const payload = expectObject(await readJsonBody(req), "create room message payload");
+        const result = await postRoomMessage({
+          roomId,
+          authorRole: optionalRoomRoleField(payload.authorRole, "authorRole") ?? "human",
+          authorLabel: optionalBoundedString(payload.authorLabel, "authorLabel", 80),
+          participantId: optionalBoundedString(payload.participantId, "participantId", 80),
+          kind: optionalMessageKindField(payload.kind, "kind"),
+          content: requiredBoundedString(payload.content, "content", 4000),
+          mentions: Array.isArray(payload.mentions)
+            ? payload.mentions.map((item) => optionalRoomRoleField(item, "mentions[]")).filter(Boolean) as RoomParticipantRole[]
+            : undefined,
+          sessionKey: optionalBoundedString(payload.sessionKey, "sessionKey", 220),
+          payload: asObject(payload.payload),
+        });
+        const bridge = await safePublishTaskRoomBridgeEvent({
+          type: "message_posted",
+          room: result.room,
+          message: result.message,
+          requestId,
+          metadata: {
+            generatedMessages: result.generatedMessages.length,
+          },
+        });
+        await appendOperationAudit({
+          action: "task_room_message",
+          source: "api",
+          ok: true,
+          requestId,
+          detail: `posted ${result.message.kind} message to room ${roomId}`,
+          metadata: {
+            roomId,
+            authorRole: result.message.authorRole,
+            kind: result.message.kind,
+            generatedMessages: result.generatedMessages.length,
+          },
+        });
+        return writeJson(res, 201, {
+          ok: true,
+          room: result.room,
+          message: result.message,
+          generatedMessages: result.generatedMessages,
+          summary: result.summary,
+          bridge,
+        });
+      }
+
+      if (method === "POST" && path.startsWith("/api/rooms/") && path.endsWith("/handoffs")) {
+        assertCollaborationMutationAuthorized(req, "/api/rooms/:roomId/handoffs");
+        assertJsonContentType(req);
+        const roomId = decodeRouteParam(path, /^\/api\/rooms\/([^/]+)\/handoffs$/, "roomId");
+        const payload = expectObject(await readJsonBody(req), "create handoff payload");
+        const result = await recordRoomHandoff({
+          roomId,
+          fromRole: requiredRoomRoleField(payload.fromRole, "fromRole"),
+          toRole: requiredRoomRoleField(payload.toRole, "toRole"),
+          note: optionalBoundedString(payload.note, "note", 320),
+        });
+        const handoffNote = optionalBoundedString(payload.note, "note", 320);
+        const bridge = await safePublishTaskRoomBridgeEvent({
+          type: "handoff_recorded",
+          room: result.room,
+          note: handoffNote,
+          requestId,
+          metadata: {
+            fromRole: payload.fromRole,
+            toRole: payload.toRole,
+            generatedMessages: result.generatedMessages.length,
+          },
+        });
+        await appendOperationAudit({
+          action: "task_room_handoff",
+          source: "api",
+          ok: true,
+          requestId,
+          detail: `handed off room ${roomId} from ${payload.fromRole} to ${payload.toRole}`,
+          metadata: {
+            roomId,
+            fromRole: payload.fromRole,
+            toRole: payload.toRole,
+            generatedMessages: result.generatedMessages.length,
+          },
+        });
+        return writeJson(res, 201, {
+          ok: true,
+          room: result.room,
+          generatedMessages: result.generatedMessages,
+          summary: result.summary,
+          bridge,
+        });
+      }
+
+      if (method === "POST" && path.startsWith("/api/rooms/") && path.endsWith("/assign")) {
+        assertCollaborationMutationAuthorized(req, "/api/rooms/:roomId/assign");
+        assertJsonContentType(req);
+        const roomId = decodeRouteParam(path, /^\/api\/rooms\/([^/]+)\/assign$/, "roomId");
+        const payload = expectObject(await readJsonBody(req), "assign room payload");
+        const result = await assignRoomExecution({
+          roomId,
+          executorRole: optionalRoomRoleField(payload.executorRole, "executorRole"),
+          note: optionalBoundedString(payload.note, "note", 320),
+          autoStartExecution: payload.autoStartExecution === false ? false : true,
+        });
+        const assignNote = optionalBoundedString(payload.note, "note", 320);
+        const bridge = await safePublishTaskRoomBridgeEvent({
+          type: "executor_assigned",
+          room: result.room,
+          task: result.task,
+          note: assignNote,
+          requestId,
+          metadata: {
+            autoStartExecution: payload.autoStartExecution === false ? false : true,
+            generatedMessages: result.generatedMessages.length,
+          },
+        });
+        await appendOperationAudit({
+          action: "task_room_assign",
+          source: "api",
+          ok: true,
+          requestId,
+          detail: `assigned room ${roomId} to ${result.room.assignedExecutor ?? result.task.owner}`,
+          metadata: {
+            roomId,
+            executorRole: result.room.assignedExecutor ?? result.task.owner,
+            taskStatus: result.task.status,
+            roomStage: result.room.stage,
+            generatedMessages: result.generatedMessages.length,
+          },
+        });
+        return writeJson(res, 200, {
+          ok: true,
+          room: result.room,
+          task: result.task,
+          generatedMessages: result.generatedMessages,
+          summary: result.summary,
+          bridge,
+        });
+      }
+
+      if (method === "POST" && path.startsWith("/api/rooms/") && path.endsWith("/review")) {
+        assertCollaborationMutationAuthorized(req, "/api/rooms/:roomId/review");
+        assertJsonContentType(req);
+        const roomId = decodeRouteParam(path, /^\/api\/rooms\/([^/]+)\/review$/, "roomId");
+        const payload = expectObject(await readJsonBody(req), "review room payload");
+        const outcome = payload.outcome === "approved" || payload.outcome === "rejected" ? payload.outcome : undefined;
+        if (!outcome) {
+          throw new RequestValidationError("outcome must be 'approved' or 'rejected'.", 400);
+        }
+        const result = await submitRoomReview({
+          roomId,
+          outcome,
+          note: optionalBoundedString(payload.note, "note", 320),
+          blockTask: payload.blockTask === true,
+        });
+        const reviewNote = optionalBoundedString(payload.note, "note", 320);
+        const bridge = await safePublishTaskRoomBridgeEvent({
+          type: "review_submitted",
+          room: result.room,
+          task: result.task,
+          note: reviewNote,
+          requestId,
+          metadata: {
+            outcome,
+            blockTask: payload.blockTask === true,
+            generatedMessages: result.generatedMessages.length,
+          },
+        });
+        await appendOperationAudit({
+          action: "task_room_review",
+          source: "api",
+          ok: outcome === "approved",
+          requestId,
+          detail: `review ${outcome} for room ${roomId}`,
+          metadata: {
+            roomId,
+            outcome,
+            taskStatus: result.task.status,
+            roomStage: result.room.stage,
+            generatedMessages: result.generatedMessages.length,
+          },
+        });
+        return writeJson(res, 200, {
+          ok: true,
+          room: result.room,
+          task: result.task,
+          generatedMessages: result.generatedMessages,
+          summary: result.summary,
+          bridge,
+        });
+      }
+
+      if (method === "PATCH" && path.startsWith("/api/rooms/") && path.endsWith("/stage")) {
+        assertCollaborationMutationAuthorized(req, "/api/rooms/:roomId/stage");
+        assertJsonContentType(req);
+        const roomId = decodeRouteParam(path, /^\/api\/rooms\/([^/]+)\/stage$/, "roomId");
+        const payload = expectObject(await readJsonBody(req), "update room stage payload");
+        const updated = await updateChatRoom({
+          roomId,
+          stage: requiredRoomStageField(payload.stage, "stage"),
+          ownerRole: optionalRoomRoleField(payload.ownerRole, "ownerRole"),
+        });
+        const summary = await refreshRoomSummary(roomId);
+        const bridge = await safePublishTaskRoomBridgeEvent({
+          type: "stage_changed",
+          room: updated.room,
+          note: `Stage changed to ${updated.room.stage}.`,
+          requestId,
+          metadata: {
+            ownerRole: updated.room.ownerRole,
+          },
+        });
+        await appendOperationAudit({
+          action: "task_room_stage",
+          source: "api",
+          ok: true,
+          requestId,
+          detail: `set room ${roomId} stage to ${updated.room.stage}`,
+          metadata: {
+            roomId,
+            stage: updated.room.stage,
+            ownerRole: updated.room.ownerRole,
+          },
+        });
+        return writeJson(res, 200, {
+          ok: true,
+          room: updated.room,
+          summary,
+          bridge,
+        });
+      }
+
+      if (method === "GET" && path.startsWith("/api/rooms/") && path.endsWith("/bridge-events")) {
+        const roomId = decodeRouteParam(path, /^\/api\/rooms\/([^/]+)\/bridge-events$/, "roomId");
+        assertAllowedQueryParams(url.searchParams, ["limit"], true);
+        const limit = readPositiveIntQuery(url.searchParams.get("limit"), "limit", 20, true, 200);
+        const store = await loadTaskRoomBridgeStore();
+        const events = listTaskRoomBridgeEvents(store, { roomId, limit });
+        return writeJson(res, 200, {
+          ok: true,
+          updatedAt: store.updatedAt,
+          count: events.length,
+          events,
+        });
+      }
+
+      if (method === "GET" && path.startsWith("/api/rooms/")) {
+        const roomId = decodeRouteParam(path, /^\/api\/rooms\/([^/]+)$/, "roomId");
+        assertAllowedQueryParams(url.searchParams, ["historyLimit"], true);
+        const historyLimit = readPositiveIntQuery(url.searchParams.get("historyLimit"), "historyLimit", 25, true, 200);
+        const detail = await readRoomDetail(roomId);
+        const taskStore = await loadTaskStore();
+        const task = taskStore.tasks.find(
+          (item) => item.projectId === detail.room.projectId && item.taskId === detail.room.taskId,
+        );
+        const evidenceMessages = await buildRoomEvidenceMessages(detail.room, historyLimit, toolClient);
+        return writeJson(res, 200, {
+          ok: true,
+          room: detail.room,
+          task,
+          summary: detail.summary,
+          storedMessages: detail.messages,
+          evidenceMessages,
+        });
       }
 
       if (method === "GET" && (path === "/sessions" || path === "/api/sessions")) {
@@ -1902,7 +2788,8 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
       if (
         error instanceof TaskStoreValidationError ||
         error instanceof ProjectStoreValidationError ||
-        error instanceof NotificationCenterValidationError
+        error instanceof NotificationCenterValidationError ||
+        error instanceof ChatStoreValidationError
       ) {
         console.warn("[mission-control] ui request validation", {
           requestId,
@@ -2741,6 +3628,9 @@ function dashboardSectionLinks(language: UiLanguage): DashboardSectionLink[] {
     if (item.key === "collaboration") {
       return { ...item, label: "协作", blurb: "智能体交接与协同" };
     }
+    if (item.key === "hall-chat") {
+      return { ...item, label: "群聊", blurb: "共享大厅群聊" };
+    }
     if (item.key === "memory") {
       return { ...item, label: "记忆", blurb: "每日与长期记忆" };
     }
@@ -3101,12 +3991,16 @@ function localizeConnectionInsightValue(
   if (item.key === "gateway") {
     return item.status === "ok"
       ? pickUiText(language, "Connected", "已接通")
-      : pickUiText(language, "Unavailable", "未接通");
+      : item.status === "info"
+        ? pickUiText(language, "Partial", "部分可见")
+        : pickUiText(language, "Unavailable", "未接通");
   }
   if (item.key === "config") {
     return item.status === "ok"
       ? pickUiText(language, "Ready", "已就绪")
-      : pickUiText(language, "Needs fix", "待修复");
+      : item.status === "info"
+        ? pickUiText(language, "Partial", "部分可见")
+        : pickUiText(language, "Needs fix", "待修复");
   }
   if (item.value === "loading") {
     return pickUiText(language, "Loading", "读取中");
@@ -3119,9 +4013,15 @@ function localizeConnectionInsightDetail(
   language: UiLanguage,
 ): string {
   if (item.key === "gateway") {
-    return item.status === "ok"
-      ? item.detail
-      : pickUiText(language, "Gateway is not reachable.", "当前还无法连到 Gateway。");
+    if (item.status === "ok") return item.detail;
+    if (item.detail === "Runtime data is flowing, but the direct Gateway probe is unavailable on this host") {
+      return pickUiText(
+        language,
+        "Runtime data is flowing, but the direct Gateway probe is unavailable on this host.",
+        "运行时数据已经在流动，但当前这台机器还拿不到 Gateway 的直接探测结果。",
+      );
+    }
+    return pickUiText(language, "Gateway is not reachable.", "当前还无法连到 Gateway。");
   }
   if (item.key === "config") {
     const allowedOriginsMatch = item.detail.match(/^(\d+) allowed origin/);
@@ -3135,6 +4035,16 @@ function localizeConnectionInsightDetail(
     }
     if (item.detail === "Local-only by default") {
       return pickUiText(language, "Local-only by default.", "默认仅允许本机访问。");
+    }
+    if (item.detail === "Runtime data is visible, but config validation is unavailable on this host") {
+      return pickUiText(
+        language,
+        "Runtime data is visible, but config validation is unavailable on this host.",
+        "运行时数据已经可见，但当前这台机器还拿不到配置校验结果。",
+      );
+    }
+    if (item.detail === "openclaw.json probe is unavailable") {
+      return pickUiText(language, "openclaw.json probe is unavailable.", "当前这台机器还拿不到 openclaw.json 探测结果。");
     }
     return pickUiText(language, "openclaw.json is missing or invalid.", "openclaw.json 缺失或配置无效。");
   }
@@ -3161,6 +4071,10 @@ function localizeConnectionInsightDetail(
     return pickUiText(language, "Runtime status is still loading.", "正在读取运行时状态。");
   }
   return pickUiText(language, "No runtime sessions are visible yet.", "当前还没有看到运行时会话。");
+}
+
+function officialControlUiHref(language: UiLanguage): string {
+  return OPENCLAW_CONTROL_UI_URL ?? "https://openclaw.cc/en/web/control-ui";
 }
 
 function localizeSecurityFinding(
@@ -3290,8 +4204,10 @@ function renderOpenClawConnectionCard(
         <h2>${escapeHtml(pickUiText(language, "Connection health", "接线状态"))}</h2>
         <div class="meta">${escapeHtml(headline)}</div>
       </div>
-      <a class="btn" href="${escapeHtml(buildHomeHref({ quick: "all" }, true, "settings", language))}">${escapeHtml(
-        pickUiText(language, "Open settings", "查看设置"),
+      <a class="btn" href="${escapeHtml(officialControlUiHref(language))}" target="_blank" rel="noreferrer">${escapeHtml(
+        OPENCLAW_CONTROL_UI_URL
+          ? pickUiText(language, "Official panel", "官方控制面板")
+          : pickUiText(language, "Official panel guide", "官方控制面板说明"),
       )}</a>
       <a class="btn" href="https://app.openclaw.ai" target="_blank" rel="noopener noreferrer">${escapeHtml(
         pickUiText(language, "OpenClaw Dashboard ↗", "OpenClaw 官方面板 ↗"),
@@ -4803,6 +5719,7 @@ async function renderHtml(
         : options.section;
   const usageCostMode: UsageCostMode = "full";
   const sectionMeta = sectionLinks.find((item) => item.key === activeSection) ?? sectionLinks[0];
+  const collaborationImmersive = false;
   const sectionTitle = resolveDashboardSectionTitle(sectionMeta, options.language);
   const sectionLeadText =
     activeSection === "overview"
@@ -4810,12 +5727,17 @@ async function renderHtml(
           "Decide from one screen: system health, items needing your intervention, who is active, and AI burn.",
           "一个首页只回答四件事：系统是否正常、哪里需要你介入、谁在忙、AI 用量是否异常。",
         )
-      : activeSection === "collaboration"
+      : activeSection === "hall-chat"
         ? t(
-            "Follow how work moves between agents: who accepted it, who received the handoff, and where collaboration is currently waiting.",
-            "直接看任务是怎么在智能体之间流转的：谁先接单、后来交给了谁、当前卡在哪一段协作里。",
+            "Use one shared chat to assign work, watch discussion, and track handoffs between agents.",
+            "在一条共享群聊里布置任务、观看讨论，并追踪 agent 之间的交接。",
           )
-      : activeSection === "projects-tasks"
+        : activeSection === "collaboration"
+          ? t(
+              "Follow how work moves between agents: who accepted it, who received the handoff, and where collaboration is currently waiting.",
+              "直接看任务是怎么在智能体之间流转的：谁先接单、后来交给了谁、当前卡在哪一段协作里。",
+            )
+        : activeSection === "projects-tasks"
         ? t(
             "Start with schedule and cron execution. Staff can be active from cron or ad-hoc sessions even when there is no tracked task row yet.",
             "先看排程和 Cron 执行。员工显示在工作，可能只是 Cron 或临时会话在跑，不一定已经落成可跟踪的任务条目。",
@@ -4831,6 +5753,7 @@ async function renderHtml(
   const needsUpdateSummary = activeSection === "settings";
   const needsMemoryState = activeSection === "memory";
   const needsCollaborationThreads = activeSection === "collaboration";
+  const needsHallChat = activeSection === "hall-chat";
   const needsTaskCertainty = activeSection === "overview" || activeSection === "projects-tasks";
   const needsGlobalVisibility = activeSection === "overview";
   const needsExecutionChainPresentation = activeSection === "overview" || activeSection === "projects-tasks";
@@ -6224,6 +7147,90 @@ async function renderHtml(
       </div>
     </details>
   `;
+  const hallView = needsHallChat ? await readCollaborationHall() : undefined;
+  const selectedHallTaskCard =
+    hallView
+      ? (options.selectedTaskCardId
+          ? hallView.taskCards.find((card) => card.taskCardId === options.selectedTaskCardId)
+          : undefined) ?? hallView.taskCards[0]
+      : undefined;
+  const selectedHallTaskSummary =
+    selectedHallTaskCard && hallView
+      ? hallView.taskSummaries.find((summary) => summary.taskCardId === selectedHallTaskCard.taskCardId)
+      : undefined;
+  const selectedHallTask =
+    selectedHallTaskCard
+      ? snapshot.tasks.tasks.find(
+          (task) => task.projectId === selectedHallTaskCard.projectId && task.taskId === selectedHallTaskCard.taskId,
+        )
+      : undefined;
+  const selectedHallTaskDetail =
+    selectedHallTaskCard
+      ? await readCollaborationHallTaskDetail(selectedHallTaskCard.taskCardId)
+      : undefined;
+  const collaborationHallWorkbench =
+    needsHallChat && hallView
+      ? renderCollaborationHall({
+          language: options.language,
+          hall: hallView.hall,
+          hallSummary: hallView.hallSummary,
+          taskCards: hallView.taskCards.map((card) => ({
+            card,
+            summary: hallView.taskSummaries.find((summary) => summary.taskCardId === card.taskCardId),
+            task: snapshot.tasks.tasks.find((task) => task.projectId === card.projectId && task.taskId === card.taskId),
+          })),
+          messages: selectedHallTaskDetail?.messages ?? hallView.messages.slice(-160),
+          selectedTaskCard: selectedHallTaskDetail?.taskCard ?? selectedHallTaskCard,
+          selectedTaskSummary: selectedHallTaskDetail?.taskSummary ?? selectedHallTaskSummary,
+          selectedTask: selectedHallTaskDetail?.task ?? selectedHallTask,
+        })
+      : "";
+
+  const needsTaskRoomWorkbench = options.section === "collaboration" || Boolean(options.selectedRoomId);
+  const taskRoomViews = needsTaskRoomWorkbench
+    ? listChatRooms(await loadChatRoomStore()).map((room) => ({
+        room,
+        summary: undefined as ReturnType<typeof getChatRoomSummary> | undefined,
+      }))
+    : [];
+  const preferredTaskRoom =
+    options.selectedRoomId !== undefined
+      ? taskRoomViews.find((item) => item.room.roomId === options.selectedRoomId)?.room
+      : undefined;
+  let selectedTaskRoom = preferredTaskRoom ?? taskRoomViews[0]?.room;
+  let selectedTaskRoomSummary = undefined as ReturnType<typeof getChatRoomSummary> | undefined;
+  let selectedTaskRoomMessages: ChatMessage[] = [];
+  let selectedTaskRoomTask = undefined as ReadModelSnapshot["tasks"]["tasks"][number] | undefined;
+
+  if (needsTaskRoomWorkbench) {
+    const summaryStore = await loadChatSummaryStore();
+    taskRoomViews.forEach((item) => {
+      item.summary = getChatRoomSummary(summaryStore, item.room.roomId);
+    });
+    if (selectedTaskRoom) {
+      const detail = await readRoomDetail(selectedTaskRoom.roomId);
+      selectedTaskRoom = detail.room;
+      selectedTaskRoomSummary = detail.summary;
+      selectedTaskRoomMessages = detail.messages.slice(-120);
+      selectedTaskRoomTask = snapshot.tasks.tasks.find(
+        (task) => task.projectId === selectedTaskRoom?.projectId && task.taskId === selectedTaskRoom?.taskId,
+      );
+    }
+  }
+  const taskRoomWorkbench = needsTaskRoomWorkbench
+    ? renderTaskRoomWorkbench({
+        language: options.language,
+        rooms: taskRoomViews.map((item) => ({
+          room: item.room,
+          summary: item.summary,
+          task: snapshot.tasks.tasks.find((task) => task.projectId === item.room.projectId && task.taskId === item.room.taskId),
+        })),
+        selectedRoom: selectedTaskRoom,
+        selectedMessages: selectedTaskRoomMessages,
+        selectedSummary: selectedTaskRoomSummary,
+        selectedTask: selectedTaskRoomTask,
+      })
+    : "";
   const collaborationSection = `
     <section class="card" id="collaboration-hub">
       <div class="overview-command-head">
@@ -6283,6 +7290,9 @@ async function renderHtml(
       </div>
       ${collaborationThreadHtml}
     </section>
+  `;
+  const hallChatSection = `
+    ${collaborationHallWorkbench}
   `;
   const memoryMainCount = memoryFiles.filter((entry) => entry.facetKey === "main").length;
   const memoryWorkbench = needsMemoryFiles
@@ -6685,6 +7695,7 @@ async function renderHtml(
   if (options.section === "calendar") sectionBody = projectsSection;
   if (options.section === "team") sectionBody = teamUnifiedSection;
   if (options.section === "collaboration") sectionBody = collaborationSection;
+  if (options.section === "hall-chat") sectionBody = hallChatSection;
   if (options.section === "memory") sectionBody = memorySection;
   if (options.section === "docs") sectionBody = docsSection;
   if (options.section === "usage-cost") sectionBody = usageSection;
@@ -6729,7 +7740,11 @@ async function renderHtml(
   const fileWorkbenchScript = renderFileWorkbenchScript();
   const agentVisualEnhancerScript = renderAgentVisualEnhancerScript();
   const nativeMotionScript = renderNativeMotionScript(options.language);
-  const collaborationFilterScript = renderCollaborationFilterScript(options.language);
+  const collaborationHallScript =
+    options.section === "hall-chat" ? renderCollaborationHallClientScript(options.language) : "";
+  const collaborationFilterScript =
+    options.section === "collaboration" ? renderCollaborationFilterScript(options.language) : "";
+  const taskRoomWorkbenchScript = needsTaskRoomWorkbench ? renderTaskRoomClientScript(options.language) : "";
   const quotaResetScript = renderQuotaResetScript();
   const headerControlsScript = renderHeaderControlsScript(options.language);
   const avatarEditorScript = renderAvatarEditorScript(options.language, IMPORT_MUTATION_ENABLED);
@@ -7054,6 +8069,155 @@ async function renderHtml(
       grid-template-columns: 232px minmax(0, 1fr);
     }
     body.inspector-collapsed .inspector-sidebar {
+      display: none;
+    }
+    body.section-collaboration .app-shell {
+      grid-template-columns: 148px minmax(0, 1fr);
+      max-width: 1560px;
+    }
+    body.section-collaboration .inspector-sidebar {
+      display: none;
+    }
+    body.section-collaboration .panel {
+      padding: 16px 18px 18px;
+    }
+    body.section-collaboration .section-hero-head {
+      display: none;
+    }
+    body.section-collaboration .content-stack {
+      margin-top: 0;
+    }
+    body.section-collaboration .sidebar {
+      padding: 10px;
+    }
+    body.section-collaboration .brand {
+      padding: 10px;
+    }
+    body.section-collaboration .brand h1 {
+      font-size: 16px;
+      margin-top: 6px;
+      line-height: 1.1;
+    }
+    body.section-collaboration .nav-links {
+      gap: 6px;
+    }
+    body.section-collaboration .nav-link {
+      padding: 9px 10px;
+      border-radius: 13px;
+    }
+    body.section-collaboration .nav-link span {
+      font-size: 14px;
+    }
+    body.section-collaboration .nav-link small {
+      display: none;
+    }
+    body.section-hall-chat .app-shell {
+      grid-template-columns: 240px minmax(0, 1fr);
+      max-width: none;
+      min-height: 100dvh;
+      padding: 10px;
+    }
+    body.section-hall-chat .app-shell > .sidebar:first-of-type {
+      grid-column: 1;
+      grid-row: 1;
+    }
+    body.section-hall-chat .inspector-sidebar {
+      display: none;
+    }
+    body.section-hall-chat .panel {
+      grid-column: 2;
+      grid-row: 1;
+      padding: 10px;
+      min-height: calc(100dvh - 20px);
+      height: calc(100dvh - 20px);
+      max-height: calc(100dvh - 20px);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    body.section-hall-chat .section-hero-head {
+      display: none;
+    }
+    body.section-hall-chat .content-stack {
+      margin-top: 0;
+      flex: 1;
+      min-height: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+    body.section-hall-chat .sidebar {
+      padding: 14px;
+    }
+    body.section-hall-chat .brand {
+      padding: 14px;
+    }
+    body.section-hall-chat .brand h1 {
+      font-size: 18px;
+      margin-top: 8px;
+      line-height: 1.18;
+      word-break: keep-all;
+    }
+    body.section-hall-chat .nav-links {
+      gap: 8px;
+    }
+    @media (max-width: 1120px) {
+      body.section-hall-chat .app-shell {
+        grid-template-columns: 120px minmax(0, 1fr);
+        gap: 10px;
+        padding: 8px;
+      }
+      body.section-hall-chat .sidebar {
+        padding: 10px;
+      }
+      body.section-hall-chat .brand {
+        padding: 10px 8px;
+      }
+      body.section-hall-chat .brand h1,
+      body.section-hall-chat .brand .meta {
+        display: none;
+      }
+      body.section-hall-chat .brand-bar {
+        justify-content: space-between;
+      }
+      body.section-hall-chat .nav-link {
+        padding: 10px 12px;
+        border-radius: 14px;
+      }
+      body.section-hall-chat .nav-link span {
+        font-size: 15px;
+      }
+    }
+    @media (max-width: 760px) {
+      body.section-hall-chat .app-shell {
+        grid-template-columns: 96px minmax(0, 1fr);
+      }
+      body.section-hall-chat .sidebar {
+        padding: 8px;
+      }
+      body.section-hall-chat .brand {
+        padding: 8px 6px;
+      }
+      body.section-hall-chat .brand-kicker {
+        font-size: 11px;
+        letter-spacing: 0.18em;
+      }
+      body.section-hall-chat .nav-link {
+        padding: 9px 8px;
+      }
+      body.section-hall-chat .nav-link span {
+        font-size: 14px;
+        line-height: 1.1;
+      }
+    }
+    body.section-hall-chat .nav-link {
+      padding: 12px 14px;
+      border-radius: 16px;
+    }
+    body.section-hall-chat .nav-link span {
+      font-size: 15px;
+      white-space: nowrap;
+    }
+    body.section-hall-chat .nav-link small {
       display: none;
     }
     .sidebar {
@@ -9931,7 +11095,7 @@ async function renderHtml(
     }
   </style>
 </head>
-<body class="ui-preload" data-ui-polish="apple-native-v3" data-apple-window-controls="true" data-ui-language="${escapeHtml(options.language)}" data-token-required="${LOCAL_TOKEN_AUTH_REQUIRED ? "1" : "0"}" data-token-configured="${LOCAL_API_TOKEN ? "1" : "0"}" data-local-token-header="${escapeHtml(LOCAL_TOKEN_HEADER)}" style="--fold-open-label:${options.language === "en" ? "'Expand'" : "'展开'"}; --fold-close-label:${options.language === "en" ? "'Collapse'" : "'收起'"};">
+<body class="ui-preload${collaborationImmersive ? " section-collaboration" : ""}${activeSection === "hall-chat" ? " section-hall-chat" : ""}" data-ui-polish="apple-native-v3" data-apple-window-controls="true" data-ui-language="${escapeHtml(options.language)}" data-token-required="${LOCAL_TOKEN_AUTH_REQUIRED ? "1" : "0"}" data-token-configured="${LOCAL_API_TOKEN ? "1" : "0"}" data-local-token-header="${escapeHtml(LOCAL_TOKEN_HEADER)}" data-local-token-value="${escapeHtml(LOCAL_API_TOKEN)}" style="--fold-open-label:${options.language === "en" ? "'Expand'" : "'展开'"}; --fold-close-label:${options.language === "en" ? "'Collapse'" : "'收起'"};">
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand">
@@ -10013,7 +11177,9 @@ async function renderHtml(
   ${agentVisualEnhancerScript}
   ${fileWorkbenchScript}
   ${nativeMotionScript}
+  ${collaborationHallScript}
   ${collaborationFilterScript}
+  ${taskRoomWorkbenchScript}
   ${quotaResetScript}
   ${headerControlsScript}
   ${avatarEditorScript}
@@ -14616,26 +15782,20 @@ function renderAvatarEditorScript(language: UiLanguage = "zh", importMutationEna
   };
   const tokenKey = () => 'openclaw:local-api-token';
   const readToken = () => {
-    try { return window.localStorage.getItem(tokenKey()) || ''; } catch { return ''; }
+    try {
+      const stored = window.localStorage.getItem(tokenKey()) || '';
+      if (stored) return stored;
+    } catch {}
+    return (document.body?.dataset?.localTokenValue || '').trim();
   };
   const writeToken = (token) => {
     try { window.localStorage.setItem(tokenKey(), token || ''); } catch {}
   };
-  const promptForToken = () => {
-    const token = window.prompt('服务器安全限制，请输入 LOCAL_API_TOKEN（详见.env）');
-    if (token && token.trim()) {
-      writeToken(token.trim());
-      return token.trim();
-    }
-    return null;
-  };
   const saveAvatarToServer = async (agentId, pref) => {
     if (!IMPORT_MUTATION_ENABLED || !agentId || !pref) return false;
     let token = readToken();
-    if (!token) {
-      token = promptForToken();
-      if (!token) return false;
-    }
+    if (!token) return false;
+    writeToken(token);
     try {
       const res = await fetch('/api/avatar/preferences', {
         method: 'PATCH',
@@ -14646,18 +15806,7 @@ function renderAvatarEditorScript(language: UiLanguage = "zh", importMutationEna
         body: JSON.stringify({ agentId, mode: pref.mode, animal: pref.animal, image: pref.image }),
       });
       if (res.status === 401) {
-        // Token invalid, prompt again
-        token = promptForToken();
-        if (!token) return false;
-        const retryRes = await fetch('/api/avatar/preferences', {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-local-token': token,
-          },
-          body: JSON.stringify({ agentId, mode: pref.mode, animal: pref.animal, image: pref.image }),
-        });
-        return retryRes.ok;
+        return false;
       }
       return res.ok;
     } catch {
@@ -14679,10 +15828,8 @@ function renderAvatarEditorScript(language: UiLanguage = "zh", importMutationEna
   const uploadAvatarToServer = async (dataUrl, fileNameHint) => {
     if (!IMPORT_MUTATION_ENABLED || !dataUrl) return null;
     let token = readToken();
-    if (!token) {
-      token = promptForToken();
-      if (!token) return null;
-    }
+    if (!token) return null;
+    writeToken(token);
     try {
       const res = await fetch('/api/avatar/uploads', {
         method: 'POST',
@@ -14693,20 +15840,7 @@ function renderAvatarEditorScript(language: UiLanguage = "zh", importMutationEna
         body: JSON.stringify({ dataUrl, fileName: fileNameHint }),
       });
       if (res.status === 401) {
-        // Token invalid, prompt again
-        token = promptForToken();
-        if (!token) return null;
-        const retryRes = await fetch('/api/avatar/uploads', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-local-token': token,
-          },
-          body: JSON.stringify({ dataUrl, fileName: fileNameHint }),
-        });
-        if (!retryRes.ok) return null;
-        const data = await retryRes.json();
-        return data && data.upload ? data.upload : null;
+        return null;
       }
       if (!res.ok) return null;
       const data = await res.json();
@@ -15146,6 +16280,9 @@ function renderAvatarEditorScript(language: UiLanguage = "zh", importMutationEna
     if (pref.mode === 'pixel' && pref.animal) {
       applyAvatarDom(avatarEl, { mode: 'pixel', animal: String(pref.animal) });
     }
+  });
+  qa('.hall-pixel-avatar[data-animal], .hall-agent-avatar[data-animal], .hall-agent-avatar[data-agent-id]').forEach((avatarEl) => {
+    renderStaticPixel(avatarEl);
   });
 })();
 </script>`;
@@ -17595,7 +18732,7 @@ function avatarContentType(fileName: string): string {
   return "application/octet-stream";
 }
 
-async function serveAvatarFile(res: ServerResponse, rawFileName: string): Promise<void> {
+async function serveAvatarFile(res: ServerResponse, rawFileName: string, headOnly = false): Promise<void> {
   const fileName = normalizeSafeFileName(rawFileName);
   if (!fileName) return writeApiError(res, 404, "NOT_FOUND", "Avatar file not found.");
   const filePath = join(AVATAR_UPLOADS_DIR, fileName);
@@ -17605,10 +18742,39 @@ async function serveAvatarFile(res: ServerResponse, rawFileName: string): Promis
       "content-type": avatarContentType(fileName),
       "cache-control": "private, max-age=3600",
     });
-    res.end(buffer);
+    res.end(headOnly ? undefined : buffer);
   } catch {
     return writeApiError(res, 404, "NOT_FOUND", "Avatar file not found.");
   }
+}
+
+async function serveHallAvatarFile(res: ServerResponse, rawFileName: string, headOnly = false): Promise<void> {
+  const fileName = normalizeSafeFileName(rawFileName);
+  if (!fileName) return writeApiError(res, 404, "NOT_FOUND", "Hall avatar file not found.");
+  const filePath = join(CONTROL_CENTER_ROOT, "runtime", "exports", "staff-avatars", fileName);
+  try {
+    const buffer = await readFile(filePath);
+    res.writeHead(200, {
+      "content-type": avatarContentType(fileName),
+      "cache-control": "public, max-age=3600",
+    });
+    res.end(headOnly ? undefined : buffer);
+  } catch {
+    return writeApiError(res, 404, "NOT_FOUND", "Hall avatar file not found.");
+  }
+}
+
+function resolveControlCenterRoot(startDir: string): string {
+  const visited = new Set<string>();
+  let cursor = resolve(startDir || process.cwd());
+  while (!visited.has(cursor)) {
+    visited.add(cursor);
+    if (existsSync(join(cursor, "runtime", "exports", "staff-avatars"))) return cursor;
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  return resolve(startDir || process.cwd());
 }
 
 async function writeAvatarUploadFromDataUrl(input: { dataUrl: string; fileNameHint?: string }): Promise<{ fileName: string; sizeBytes: number }> {
@@ -17758,9 +18924,13 @@ function attachRequestIdToBody(body: unknown, requestId: string | undefined): un
   };
 }
 
-function assertMutationAuthorized(
+function assertMutationAuthorizedWithConfig(
   req: IncomingMessage,
   routeLabel: string,
+  gateConfig: {
+    gateRequired: boolean;
+    configuredToken: string;
+  },
   explicitToken?: string | null,
 ): void {
   const token =
@@ -17768,8 +18938,8 @@ function assertMutationAuthorized(
     normalizeToken(readHeaderValue(req, LOCAL_TOKEN_HEADER)) ??
     normalizeToken(readAuthorizationBearer(readHeaderValue(req, "authorization")));
   const decision = evaluateLocalTokenGate({
-    gateRequired: LOCAL_TOKEN_AUTH_REQUIRED,
-    configuredToken: LOCAL_API_TOKEN,
+    gateRequired: gateConfig.gateRequired,
+    configuredToken: gateConfig.configuredToken,
     providedToken: token,
     routeLabel,
   });
@@ -17835,6 +19005,139 @@ function decodeRouteParam(path: string, pattern: RegExp, label: string): string 
     if (error instanceof RequestValidationError) throw error;
     throw new RequestValidationError(`${label} route parameter is invalid.`, 400);
   }
+}
+
+function requiredQueryString(value: string | null, label: string): string {
+  const normalized = normalizeQueryString(value, label, 180, true);
+  if (!normalized) {
+    throw new RequestValidationError(`${label} query parameter is required.`, 400);
+  }
+  return normalized;
+}
+
+function resolveHallTaskCardRequest(
+  store: Awaited<ReturnType<typeof loadCollaborationTaskCardStore>>,
+  input: {
+    taskId: string;
+    projectId?: string;
+    taskCardId?: string;
+  },
+): HallTaskCard {
+  if (input.taskCardId) {
+    const taskCard = getHallTaskCard(store, input.taskCardId);
+    if (!taskCard) {
+      throw new RequestValidationError(`task card '${input.taskCardId}' was not found.`, 404);
+    }
+    if (taskCard.taskId !== input.taskId) {
+      throw new RequestValidationError(
+        `taskCardId '${input.taskCardId}' does not belong to task '${input.taskId}'.`,
+        400,
+      );
+    }
+    return taskCard;
+  }
+
+  if (input.projectId) {
+    const taskCard = getHallTaskCardByTask(store, input.projectId, input.taskId);
+    if (!taskCard) {
+      throw new RequestValidationError(`task '${input.projectId}:${input.taskId}' does not have a hall task card yet.`, 404);
+    }
+    return taskCard;
+  }
+
+  const matches = store.taskCards.filter((taskCard) => taskCard.taskId === input.taskId);
+  if (matches.length === 0) {
+    throw new RequestValidationError(`task '${input.taskId}' does not have a hall task card yet.`, 404);
+  }
+  if (matches.length > 1) {
+    throw new RequestValidationError(
+      `taskId '${input.taskId}' is ambiguous. Provide projectId or taskCardId.`,
+      409,
+    );
+  }
+  return matches[0];
+}
+
+function normalizeHallTaskStageQuery(value: string | null): "discussion" | "execution" | "review" | "blocked" | "completed" | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (
+    trimmed === "discussion" ||
+    trimmed === "execution" ||
+    trimmed === "review" ||
+    trimmed === "blocked" ||
+    trimmed === "completed"
+  ) {
+    return trimmed;
+  }
+  throw new RequestValidationError(
+    "stage must be one of: discussion, execution, review, blocked, completed",
+    400,
+  );
+}
+
+function normalizeRoomStageQuery(value: string | null): RoomStage | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (
+    trimmed === "intake" ||
+    trimmed === "discussion" ||
+    trimmed === "assigned" ||
+    trimmed === "executing" ||
+    trimmed === "review" ||
+    trimmed === "completed"
+  ) {
+    return trimmed;
+  }
+  throw new RequestValidationError(
+    "stage must be one of: intake, discussion, assigned, executing, review, completed",
+    400,
+  );
+}
+
+function requiredRoomStageField(input: unknown, label: string): RoomStage {
+  if (typeof input !== "string") {
+    throw new RequestValidationError(`${label} is required.`, 400);
+  }
+  const normalized = normalizeRoomStageQuery(input);
+  if (!normalized) {
+    throw new RequestValidationError(`${label} is required.`, 400);
+  }
+  return normalized;
+}
+
+function optionalRoomRoleField(input: unknown, label: string): RoomParticipantRole | undefined {
+  if (input === undefined) return undefined;
+  if (input === "human" || input === "planner" || input === "coder" || input === "reviewer" || input === "manager") {
+    return input;
+  }
+  throw new RequestValidationError(`${label} must be one of: human, planner, coder, reviewer, manager.`, 400);
+}
+
+function requiredRoomRoleField(input: unknown, label: string): RoomParticipantRole {
+  const normalized = optionalRoomRoleField(input, label);
+  if (!normalized) {
+    throw new RequestValidationError(`${label} is required.`, 400);
+  }
+  return normalized;
+}
+
+function optionalMessageKindField(
+  input: unknown,
+  label: string,
+): "chat" | "proposal" | "decision" | "handoff" | "status" | "result" | undefined {
+  if (input === undefined) return undefined;
+  if (
+    input === "chat" ||
+    input === "proposal" ||
+    input === "decision" ||
+    input === "handoff" ||
+    input === "status" ||
+    input === "result"
+  ) {
+    return input;
+  }
+  throw new RequestValidationError(`${label} must be one of: chat, proposal, decision, handoff, status, result.`, 400);
 }
 
 function normalizeQueryString(
@@ -17960,6 +19263,70 @@ function safeTruncate(input: string, maxLength: number): string {
   if (input.length <= maxLength) return input;
   if (maxLength <= 3) return input.slice(0, Math.max(0, maxLength));
   return `${input.slice(0, maxLength - 3)}...`;
+}
+
+async function buildRoomEvidenceMessages(
+  room: ChatRoom,
+  historyLimit: number,
+  toolClient: ToolClient,
+): Promise<ChatMessage[]> {
+  if (room.sessionKeys.length === 0) return [];
+
+  const snapshot = await readReadModelSnapshotWithLiveSessions(toolClient);
+  const details = await Promise.all(
+    room.sessionKeys.slice(0, 8).map((sessionKey) =>
+      getSessionConversationDetail({
+        snapshot,
+        client: toolClient,
+        sessionKey,
+        historyLimit,
+      }),
+    ),
+  );
+
+  return details
+    .filter((detail): detail is SessionConversationDetailResult => Boolean(detail))
+    .map((detail) => {
+      const latestVisible = [...detail.history]
+        .reverse()
+        .find((item) => item.kind === "tool_event" || item.kind === "inter_session" || item.kind === "message");
+      const contentSource = latestVisible?.content ?? detail.latestSnippet ?? "Runtime evidence is available.";
+      const content = `Evidence from ${detail.session.sessionKey}: ${safeTruncate(
+        contentSource.replace(/\s+/g, " ").trim(),
+        240,
+      )}`;
+      return {
+        roomId: room.roomId,
+        messageId: `evidence:${detail.session.sessionKey}:${detail.latestHistoryAt ?? detail.generatedAt}`,
+        kind: latestVisible?.kind === "tool_event" ? "result" : "status",
+        authorRole: room.assignedExecutor ?? "coder",
+        authorLabel: detail.session.agentId?.trim() || "Runtime",
+        participantId: detail.session.agentId?.trim() || undefined,
+        content,
+        mentions: [],
+        sessionKey: detail.session.sessionKey,
+        payload: {
+          status: latestVisible?.kind === "tool_event" ? "tool_event" : "runtime_signal",
+          sessionKey: detail.session.sessionKey,
+          sourceSessionKey: detail.session.sessionKey,
+          sourceTool: latestVisible?.toolName,
+        },
+        createdAt: detail.latestHistoryAt ?? detail.generatedAt,
+      } satisfies ChatMessage;
+    });
+}
+
+async function safePublishTaskRoomBridgeEvent(input: Parameters<typeof publishTaskRoomBridgeEvent>[0]) {
+  try {
+    return await publishTaskRoomBridgeEvent(input);
+  } catch (error) {
+    console.warn("[mission-control] task room bridge publish failed", {
+      roomId: input.room.roomId,
+      type: input.type,
+      error: error instanceof Error ? error.message : "unknown error",
+    });
+    return undefined;
+  }
 }
 
 function projectTitleMap(snapshot: ReadModelSnapshot): Map<string, string> {

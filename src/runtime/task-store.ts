@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { loadProjectStore } from "./project-store";
+import { getRuntimeDir, resolveRuntimePath } from "./runtime-path";
 import type {
   AgentBudgetPlan,
   BudgetThresholds,
@@ -12,8 +12,8 @@ import type {
   TaskStoreSnapshot,
 } from "../types";
 
-const RUNTIME_DIR = join(process.cwd(), "runtime");
-export const TASKS_PATH = join(RUNTIME_DIR, "tasks.json");
+const RUNTIME_DIR = getRuntimeDir();
+export const TASKS_PATH = resolveRuntimePath("tasks.json");
 const DEFAULT_WARN_RATIO = 0.8;
 const PROJECT_ID_REGEX = /^[A-Za-z0-9._:-]+$/;
 const TASK_ID_REGEX = /^[A-Za-z0-9._:-]+$/;
@@ -42,6 +42,7 @@ export interface CreateTaskInput {
   title: string;
   status?: TaskState;
   owner?: string;
+  roomId?: string;
   dueAt?: string;
   definitionOfDone?: string[];
   artifacts?: TaskArtifact[];
@@ -53,6 +54,22 @@ export interface CreateTaskInput {
 export interface UpdateTaskStatusInput {
   taskId: string;
   status: TaskState;
+  projectId?: string;
+}
+
+export interface PatchTaskInput {
+  taskId: string;
+  projectId?: string;
+  status?: TaskState;
+  owner?: string;
+  roomId?: string | null;
+  dueAt?: string | null;
+  sessionKeys?: string[];
+  artifacts?: TaskArtifact[];
+}
+
+export interface DeleteTaskInput {
+  taskId: string;
   projectId?: string;
 }
 
@@ -95,6 +112,7 @@ export function listTasks(
       title: task.title,
       status: task.status,
       owner: task.owner,
+      roomId: task.roomId,
       dueAt: task.dueAt,
       sessionKeys: task.sessionKeys,
       updatedAt: task.updatedAt,
@@ -127,6 +145,7 @@ export async function createTask(input: unknown): Promise<TaskMutationResult> {
     title: payload.title,
     status: payload.status ?? "todo",
     owner: payload.owner ?? "unassigned",
+    roomId: payload.roomId,
     dueAt: payload.dueAt,
     definitionOfDone: payload.definitionOfDone ?? [],
     artifacts: payload.artifacts ?? [],
@@ -197,6 +216,100 @@ export async function updateTaskStatus(input: unknown): Promise<TaskMutationResu
   };
 }
 
+export async function patchTask(input: PatchTaskInput): Promise<TaskMutationResult> {
+  const payload = validatePatchTaskInput(input);
+  const [store, projectStore] = await Promise.all([loadTaskStore(), loadProjectStore()]);
+  const matches = findTaskMatches(store, payload.taskId, payload.projectId);
+
+  if (matches.length === 0) {
+    throw new TaskStoreValidationError(
+      `taskId '${payload.taskId}' was not found${payload.projectId ? ` in project '${payload.projectId}'` : ""}.`,
+      [],
+      404,
+    );
+  }
+
+  if (matches.length > 1) {
+    throw new TaskStoreValidationError(
+      `taskId '${payload.taskId}' is ambiguous. Provide projectId.`,
+      ["projectId"],
+      409,
+    );
+  }
+
+  const target = matches[0];
+  const project = projectStore.projects.find((item) => item.projectId === target.task.projectId);
+  if (!project) {
+    throw new TaskStoreValidationError(
+      `projectId '${target.task.projectId}' referenced by task '${target.task.taskId}' was not found.`,
+      ["projectId"],
+      409,
+    );
+  }
+
+  const now = new Date().toISOString();
+  if (payload.status !== undefined) target.task.status = payload.status;
+  if (payload.owner !== undefined) target.task.owner = payload.owner;
+  if (payload.roomId !== undefined) target.task.roomId = payload.roomId ?? undefined;
+  if (payload.dueAt !== undefined) target.task.dueAt = payload.dueAt ?? undefined;
+  if (payload.sessionKeys !== undefined) target.task.sessionKeys = payload.sessionKeys;
+  if (payload.artifacts !== undefined) target.task.artifacts = payload.artifacts;
+  target.task.updatedAt = now;
+  store.updatedAt = now;
+
+  const path = await saveTaskStore(store);
+  return {
+    path,
+    projectId: target.task.projectId,
+    projectTitle: project.title,
+    task: target.task,
+  };
+}
+
+export async function deleteTask(input: DeleteTaskInput): Promise<TaskMutationResult> {
+  const payload = validateDeleteTaskInput(input);
+  const [store, projectStore] = await Promise.all([loadTaskStore(), loadProjectStore()]);
+  const matches = findTaskMatches(store, payload.taskId, payload.projectId);
+
+  if (matches.length === 0) {
+    throw new TaskStoreValidationError(
+      `taskId '${payload.taskId}' was not found${payload.projectId ? ` in project '${payload.projectId}'` : ""}.`,
+      [],
+      404,
+    );
+  }
+
+  if (matches.length > 1) {
+    throw new TaskStoreValidationError(
+      `taskId '${payload.taskId}' is ambiguous. Provide projectId.`,
+      ["projectId"],
+      409,
+    );
+  }
+
+  const target = matches[0];
+  const project = projectStore.projects.find((item) => item.projectId === target.task.projectId);
+  if (!project) {
+    throw new TaskStoreValidationError(
+      `projectId '${target.task.projectId}' referenced by task '${target.task.taskId}' was not found.`,
+      ["projectId"],
+      409,
+    );
+  }
+
+  const deletedTask = { ...target.task };
+  const now = new Date().toISOString();
+  store.tasks = store.tasks.filter((task) => !(task.projectId === deletedTask.projectId && task.taskId === deletedTask.taskId));
+  store.updatedAt = now;
+  const path = await saveTaskStore(store);
+  return {
+    path,
+    projectId: deletedTask.projectId,
+    projectTitle: project.title,
+    task: deletedTask,
+  };
+}
+
 function findTaskMatches(
   store: TaskStoreSnapshot,
   taskId: string,
@@ -223,6 +336,7 @@ function validateCreateTaskInput(input: unknown): CreateTaskInput {
   const title = requiredBoundedString(obj.title, "title", 180, issues);
   const status = optionalTaskState(obj.status, "status", issues);
   const owner = optionalBoundedString(obj.owner, "owner", 80, issues);
+  const roomId = optionalRoomId(obj.roomId, "roomId", issues);
   const dueAt = optionalIsoString(obj.dueAt, "dueAt", issues);
   const definitionOfDone = optionalStringArray(obj.definitionOfDone, "definitionOfDone", issues);
   const sessionKeys = optionalStringArray(obj.sessionKeys, "sessionKeys", issues);
@@ -240,12 +354,68 @@ function validateCreateTaskInput(input: unknown): CreateTaskInput {
     title,
     status,
     owner,
+    roomId,
     dueAt,
     definitionOfDone,
     sessionKeys,
     artifacts,
     rollback,
     budget,
+  };
+}
+
+function validatePatchTaskInput(input: PatchTaskInput): PatchTaskInput {
+  const obj = ensureObject(input, "patch task payload");
+  const issues: string[] = [];
+  const taskId = requiredTaskId(obj.taskId, "taskId", issues);
+  const projectId = optionalProjectId(obj.projectId, "projectId", issues);
+  const status = optionalTaskState(obj.status, "status", issues);
+  const owner = optionalBoundedString(obj.owner, "owner", 80, issues);
+  const roomId = optionalNullableRoomId(obj.roomId, "roomId", issues);
+  const dueAt = optionalNullableIsoString(obj.dueAt, "dueAt", issues);
+  const sessionKeys = optionalStringArray(obj.sessionKeys, "sessionKeys", issues);
+  const artifacts = optionalArtifacts(obj.artifacts, "artifacts", issues);
+
+  if (
+    status === undefined &&
+    owner === undefined &&
+    roomId === undefined &&
+    dueAt === undefined &&
+    sessionKeys === undefined &&
+    artifacts === undefined
+  ) {
+    issues.push("at least one patchable field is required: status, owner, roomId, dueAt, sessionKeys, artifacts");
+  }
+
+  if (issues.length > 0) {
+    throw new TaskStoreValidationError("Invalid patch task payload.", issues, 400);
+  }
+
+  return {
+    taskId,
+    projectId,
+    status,
+    owner,
+    roomId,
+    dueAt,
+    sessionKeys,
+    artifacts,
+  };
+}
+
+function validateDeleteTaskInput(input: DeleteTaskInput): DeleteTaskInput {
+  const obj = ensureObject(input, "delete task payload");
+  const issues: string[] = [];
+  const taskId = requiredTaskId(obj.taskId, "taskId", issues);
+  const projectId = optionalProjectId(obj.projectId, "projectId", issues);
+
+  if (issues.length > 0) {
+    throw new TaskStoreValidationError("Invalid delete task payload.", issues, 400);
+  }
+
+  return {
+    taskId,
+    projectId,
   };
 }
 
@@ -324,6 +494,7 @@ function normalizeTask(input: unknown, fallbackProjectId?: string): ProjectTask 
     title: asString(obj.title) ?? taskId,
     status: normalizeTaskState(asString(obj.status)),
     owner: asString(obj.owner) ?? "unassigned",
+    roomId: normalizeOptionalRoomId(asString(obj.roomId)),
     dueAt: asOptionalIsoString(obj.dueAt),
     definitionOfDone: toStringArray(obj.definitionOfDone),
     artifacts: normalizeArtifacts(asArray(obj.artifacts)),
@@ -506,6 +677,42 @@ function optionalBoundedString(
   return trimmed;
 }
 
+function optionalRoomId(
+  value: unknown,
+  field: string,
+  issues: string[],
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") {
+    issues.push(`${field} must be a string`);
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    issues.push(`${field} cannot be empty when provided`);
+    return undefined;
+  }
+  if (!TASK_ID_REGEX.test(trimmed)) {
+    issues.push(`${field} may only contain letters, numbers, '.', '_', ':', '-'`);
+    return undefined;
+  }
+  if (trimmed.length > 140) {
+    issues.push(`${field} must be <= 140 characters`);
+    return undefined;
+  }
+  return trimmed;
+}
+
+function optionalNullableRoomId(
+  value: unknown,
+  field: string,
+  issues: string[],
+): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  return optionalRoomId(value, field, issues) ?? null;
+}
+
 function optionalStringArray(
   value: unknown,
   field: string,
@@ -535,6 +742,16 @@ function optionalIsoString(
     return undefined;
   }
   return new Date(value).toISOString();
+}
+
+function optionalNullableIsoString(
+  value: unknown,
+  field: string,
+  issues: string[],
+): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  return optionalIsoString(value, field, issues) ?? null;
 }
 
 function optionalTaskState(
@@ -657,6 +874,13 @@ function asOptionalIsoString(v: unknown): string | undefined {
   if (typeof v !== "string") return undefined;
   if (Number.isNaN(Date.parse(v))) return undefined;
   return new Date(v).toISOString();
+}
+
+function normalizeOptionalRoomId(v: string | undefined): string | undefined {
+  if (!v) return undefined;
+  const trimmed = v.trim();
+  if (!trimmed || !TASK_ID_REGEX.test(trimmed)) return undefined;
+  return trimmed;
 }
 
 function toStringArray(v: unknown): string[] {

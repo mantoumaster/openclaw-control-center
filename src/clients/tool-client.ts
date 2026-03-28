@@ -1,4 +1,7 @@
 import type {
+  AgentRunRequest,
+  AgentRunResponse,
+  AgentRunStreamHandlers,
   ApprovalsActionResponse,
   ApprovalsApproveRequest,
   ApprovalsGetResponse,
@@ -19,6 +22,8 @@ export interface ToolClient {
   approvalsGet(): Promise<ApprovalsGetResponse>;
   approvalsApprove(request: ApprovalsApproveRequest): Promise<ApprovalsActionResponse>;
   approvalsReject(request: ApprovalsRejectRequest): Promise<ApprovalsActionResponse>;
+  agentRun?(request: AgentRunRequest): Promise<AgentRunResponse>;
+  agentRunStream?(request: AgentRunRequest, handlers?: AgentRunStreamHandlers): Promise<AgentRunResponse>;
 }
 
 export class ReadonlyToolClient implements ToolClient {

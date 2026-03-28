@@ -106,6 +106,12 @@ export interface SessionConversationDetailInput {
   historyLimit: number;
 }
 
+export interface SessionConversationHistoryResult {
+  sessionKey: string;
+  history: SessionHistoryMessage[];
+  historyError?: string;
+}
+
 interface SessionHistoryReadResult {
   messages: SessionHistoryMessage[];
   error?: string;
@@ -264,6 +270,21 @@ export function inferSessionExecutionChainFromSessionKey(
   session: SessionSummary,
 ): SessionExecutionChainSummary | undefined {
   return inferSessionExecutionChain(session, []);
+}
+
+export async function readSessionConversationHistory(
+  client: ToolClient,
+  sessionKey: string,
+  historyLimit: number,
+): Promise<SessionConversationHistoryResult> {
+  const normalizedSessionKey = sessionKey.trim();
+  const normalizedLimit = normalizeHistoryLimit(historyLimit, 50);
+  const history = await readSessionHistory(client, normalizedSessionKey, normalizedLimit);
+  return {
+    sessionKey: normalizedSessionKey,
+    history: history.messages,
+    historyError: history.error,
+  };
 }
 
 async function readSessionHistory(

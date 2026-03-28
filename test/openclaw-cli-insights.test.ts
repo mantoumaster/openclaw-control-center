@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildOpenClawCommandCandidates,
+  buildOpenClawCommandEnv,
   recoverOpenClawCommandJson,
   summarizeOpenClawConnection,
   summarizeOpenClawMemory,
@@ -78,6 +80,26 @@ test("summarizeOpenClawConnection and update keep loading semantics when status 
   assert.equal(update.status, "info");
   assert.equal(update.currentVersion, undefined);
   assert.equal(update.latestVersion, "2026.3.12");
+});
+
+test("summarizeOpenClawConnection keeps gateway and config in partial mode when runtime is visible but CLI probes are unavailable", () => {
+  const summary = summarizeOpenClawConnection(
+    {
+      runtimeVersion: "2026.3.11",
+      gateway: { reachable: true, url: "ws://127.0.0.1:18789" },
+      sessions: { count: 4 },
+      agents: { agents: [{ agentId: "main", sessionsCount: 4 }] },
+    },
+    {},
+  );
+
+  assert.equal(summary.status, "info");
+  assert.equal(summary.items[0]?.key, "gateway");
+  assert.equal(summary.items[0]?.status, "ok");
+  assert.equal(summary.items[0]?.value, "Connected");
+  assert.equal(summary.items[1]?.key, "config");
+  assert.equal(summary.items[1]?.status, "info");
+  assert.equal(summary.items[1]?.value, "Partial");
 });
 
 test("summarizeOpenClawSecurity keeps counts and remediation", () => {
@@ -165,4 +187,26 @@ test("recoverOpenClawCommandJson extracts JSON after plugin log prelude", () => 
     rpc: { ok: true },
     config: { cli: { exists: true, valid: true } },
   });
+});
+
+test("buildOpenClawCommandEnv adds common npm global bin paths on Windows", () => {
+  const env = buildOpenClawCommandEnv(
+    {
+      PATH: "C:\\Windows\\System32",
+      APPDATA: "C:\\Users\\alice\\AppData\\Roaming",
+      USERPROFILE: "C:\\Users\\alice",
+    },
+    "win32",
+  );
+
+  assert.match(env.PATH ?? "", /C:\\Users\\alice\\AppData\\Roaming\\npm/);
+  assert.match(env.PATH ?? "", /C:\\Windows\\System32/);
+});
+
+test("buildOpenClawCommandCandidates prefers explicit override before default command", () => {
+  assert.deepEqual(buildOpenClawCommandCandidates({ OPENCLAW_BIN_PATH: "C:\\custom\\openclaw.cmd" }, "win32"), [
+    "C:\\custom\\openclaw.cmd",
+    "openclaw",
+    "openclaw.cmd",
+  ]);
 });

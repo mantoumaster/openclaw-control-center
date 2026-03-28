@@ -4,9 +4,11 @@
 
 ## 中文版
 
-### 1. 多 Agent 工作区 — 为什么成员列表看不到职责？
+### 1. 多 Agent 工作区 — 为什么成员列表看不到职责 / 显示“工作区未写明职责”？
 
 **问题：** 已经在 `SOUL.md` 和 `AGENTS.md` 中写好了角色和职责，但控制中心的员工页面看不到具体分工。
+
+**直接回答：** 员工页当前不会直接把某个配置文件里的 `role` / `mission` 字段原样摘出来显示。它更依赖 workspace 目录、`IDENTITY.md` 这类身份线索，以及 Gateway 返回的运行时元信息。
 
 **常见原因：** 控制中心会参考 OpenClaw 的 workspace 目录和运行时信号。是否能看到完整职责信息，通常取决于：
 - OpenClaw Gateway 返回的 session 数据中是否包含 agent 元信息
@@ -40,6 +42,7 @@
    - **状态（执行中/空闲）** → 主要来自 Gateway 的 session 运行信号
    - **workspace** → 通常来自 agent 配置中的 `workspace` 字段
    - **具体职责描述** → 当前不会自动把 `SOUL.md` 摘要直接显示成员工卡片文案，更适合作为文档线索保存在 `IDENTITY.md`、`SOUL.md`、`AGENTS.md`
+   - **不会直接摘取的内容** → 任意配置文件里自定义的 `role` / `mission` 文本，目前不会被员工卡片逐字渲染成职责说明
 
 > **最佳实践：** 如果你希望控制中心更容易展示身份与职责线索，建议优先把简短身份说明写进 `IDENTITY.md`，并把详细角色说明写进 `SOUL.md` / `AGENTS.md`。
 
@@ -138,15 +141,18 @@ openclaw sessions history <session-key> --limit 5
 
 ## English Version
 
-### 1. Multi-Agent Workspace — Why Can't I See Roles in the Staff Page?
+### 1. Multi-Agent Workspace — Why Does the Staff Page Show "Role not defined in workspace"?
 
 **Issue:** Roles defined in `SOUL.md` and `AGENTS.md` don't appear in the Control Center staff list.
+
+**Short answer:** The Staff page does not currently render an arbitrary `role` or `mission` field from one config file verbatim. It relies more on workspace discovery, identity hints such as `IDENTITY.md`, and runtime metadata returned by Gateway.
 
 **Common guidance / best practice:**
 - Ensure your workspace directory follows the standard structure (`SOUL.md`, `IDENTITY.md`, `AGENTS.md`, `MEMORY.md`)
 - Set `OPENCLAW_AGENT_ROOT` environment variable to point to the parent directory of all workspaces
 - Confirm OpenClaw Gateway is running (`openclaw gateway status`)
 - A practical best practice is to put short identity/role hints in `IDENTITY.md`, and longer role definitions in `SOUL.md` / `AGENTS.md`
+- Do not expect a custom `role` / `mission` field from an arbitrary config file to appear as the exact Staff-card responsibility text
 
 ### 2. Billing & Budget — How to Connect Data and Set Limits?
 

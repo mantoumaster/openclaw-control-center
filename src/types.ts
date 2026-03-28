@@ -40,6 +40,21 @@ export interface ApprovalSummary {
 
 export type TaskState = "todo" | "in_progress" | "blocked" | "done";
 export type ProjectState = "planned" | "active" | "blocked" | "done";
+export type RoomStage = "intake" | "discussion" | "assigned" | "executing" | "review" | "completed";
+export type MessageKind = "chat" | "proposal" | "decision" | "handoff" | "status" | "result";
+export type RoomParticipantRole = "human" | "planner" | "coder" | "reviewer" | "manager";
+export type HallSemanticRole = "planner" | "coder" | "reviewer" | "manager" | "generalist";
+export type HallTaskStage = "discussion" | "execution" | "review" | "blocked" | "completed";
+export type HallMessageKind =
+  | "chat"
+  | "task"
+  | "proposal"
+  | "decision"
+  | "handoff"
+  | "status"
+  | "review"
+  | "result"
+  | "system";
 
 export type TaskArtifactType = "code" | "doc" | "link" | "other";
 
@@ -70,12 +85,292 @@ export interface ProjectTask {
   title: string;
   status: TaskState;
   owner: string;
+  roomId?: string;
   dueAt?: string;
   definitionOfDone: string[];
   artifacts: TaskArtifact[];
   rollback: RollbackPlan;
   sessionKeys: string[];
   budget: BudgetThresholds;
+  updatedAt: string;
+}
+
+export interface RoomParticipant {
+  participantId: string;
+  role: RoomParticipantRole;
+  label: string;
+  agentId?: string;
+  sessionKey?: string;
+  active: boolean;
+}
+
+export interface HandoffRecord {
+  handoffId: string;
+  roomId: string;
+  taskId: string;
+  fromRole: RoomParticipantRole;
+  toRole: RoomParticipantRole;
+  note?: string;
+  createdAt: string;
+}
+
+export interface ChatMessagePayload {
+  proposal?: string;
+  decision?: string;
+  executor?: RoomParticipantRole;
+  doneWhen?: string;
+  fromRole?: RoomParticipantRole;
+  targetRole?: RoomParticipantRole;
+  handoffId?: string;
+  status?: string;
+  taskStatus?: TaskState;
+  reviewOutcome?: "approved" | "rejected";
+  sessionKey?: string;
+  sourceSessionKey?: string;
+  sourceTool?: string;
+}
+
+export interface ChatMessage {
+  roomId: string;
+  messageId: string;
+  kind: MessageKind;
+  authorRole: RoomParticipantRole;
+  authorLabel: string;
+  participantId?: string;
+  content: string;
+  mentions: RoomParticipantRole[];
+  sessionKey?: string;
+  payload?: ChatMessagePayload;
+  createdAt: string;
+}
+
+export interface ChatRoomSummary {
+  roomId: string;
+  headline: string;
+  latestDecision?: string;
+  currentOwner?: RoomParticipantRole;
+  nextAction: string;
+  openQuestions: string[];
+  messageCount: number;
+  updatedAt: string;
+}
+
+export interface ChatRoom {
+  roomId: string;
+  projectId: string;
+  taskId: string;
+  title: string;
+  stage: RoomStage;
+  ownerRole: RoomParticipantRole;
+  assignedExecutor?: RoomParticipantRole;
+  proposal?: string;
+  decision?: string;
+  doneWhen?: string;
+  participants: RoomParticipant[];
+  handoffs: HandoffRecord[];
+  sessionKeys: string[];
+  summaryId?: string;
+  lastMessageAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChatRoomStoreSnapshot {
+  rooms: ChatRoom[];
+  updatedAt: string;
+}
+
+export interface ChatMessageStoreSnapshot {
+  messages: ChatMessage[];
+  updatedAt: string;
+}
+
+export interface ChatSummaryStoreSnapshot {
+  summaries: ChatRoomSummary[];
+  updatedAt: string;
+}
+
+export interface MentionTarget {
+  raw: string;
+  participantId: string;
+  displayName: string;
+  semanticRole: HallSemanticRole;
+}
+
+export interface ExecutionLock {
+  taskId: string;
+  projectId: string;
+  ownerParticipantId: string;
+  ownerLabel: string;
+  acquiredAt: string;
+  releasedAt?: string;
+  releasedReason?: string;
+}
+
+export interface StructuredHandoffPacket {
+  goal: string;
+  currentResult: string;
+  doneWhen: string;
+  blockers: string[];
+  nextOwner: string;
+  requiresInputFrom: string[];
+  artifactRefs?: TaskArtifact[];
+}
+
+export interface HallParticipant {
+  participantId: string;
+  agentId?: string;
+  displayName: string;
+  semanticRole: HallSemanticRole;
+  active: boolean;
+  aliases: string[];
+  isHuman?: boolean;
+}
+
+export interface TaskDiscussionCycle {
+  cycleId: string;
+  openedAt: string;
+  openedByParticipantId: string;
+  expectedParticipantIds: string[];
+  completedParticipantIds: string[];
+  closedAt?: string;
+}
+
+export interface HallMessagePayload {
+  projectId?: string;
+  taskId?: string;
+  taskCardId?: string;
+  roomId?: string;
+  proposal?: string;
+  decision?: string;
+  doneWhen?: string;
+  executionOrder?: string[];
+  executionItems?: HallExecutionItem[];
+  nextOwnerParticipantId?: string;
+  reviewOutcome?: "approved" | "rejected";
+  taskStatus?: TaskState;
+  taskStage?: HallTaskStage;
+  status?: string;
+  handoff?: StructuredHandoffPacket;
+  artifactRefs?: TaskArtifact[];
+  sessionKey?: string;
+  sourceSessionKey?: string;
+  sourceTool?: string;
+}
+
+export interface HallMessage {
+  hallId: string;
+  messageId: string;
+  kind: HallMessageKind;
+  authorParticipantId: string;
+  authorLabel: string;
+  authorSemanticRole?: HallSemanticRole;
+  content: string;
+  targetParticipantIds: string[];
+  mentionTargets: MentionTarget[];
+  projectId?: string;
+  taskId?: string;
+  taskCardId?: string;
+  roomId?: string;
+  payload?: HallMessagePayload;
+  createdAt: string;
+}
+
+export interface HallTaskCard {
+  hallId: string;
+  taskCardId: string;
+  projectId: string;
+  taskId: string;
+  roomId?: string;
+  title: string;
+  description: string;
+  stage: HallTaskStage;
+  status: TaskState;
+  createdByParticipantId: string;
+  currentOwnerParticipantId?: string;
+  currentOwnerLabel?: string;
+  proposal?: string;
+  decision?: string;
+  doneWhen?: string;
+  latestSummary?: string;
+  blockers: string[];
+  requiresInputFrom: string[];
+  mentionedParticipantIds: string[];
+  plannedExecutionOrder: string[];
+  plannedExecutionItems: HallExecutionItem[];
+  currentExecutionItem?: HallExecutionItem;
+  sessionKeys: string[];
+  discussionCycle?: TaskDiscussionCycle;
+  executionLock?: ExecutionLock;
+  archivedAt?: string;
+  archivedByParticipantId?: string;
+  archivedByLabel?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface HallExecutionItem {
+  itemId: string;
+  participantId: string;
+  task: string;
+  handoffToParticipantId?: string;
+  handoffWhen?: string;
+}
+
+export interface CollaborationHall {
+  hallId: string;
+  title: string;
+  description?: string;
+  participants: HallParticipant[];
+  taskCardIds: string[];
+  messageIds: string[];
+  lastMessageId?: string | null;
+  latestMessageAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CollaborationHallSummary {
+  hallId: string;
+  headline: string;
+  activeTaskCount: number;
+  waitingReviewCount: number;
+  blockedTaskCount: number;
+  currentSpeakerLabel?: string;
+  updatedAt: string;
+}
+
+export interface HallTaskSummary {
+  taskCardId: string;
+  projectId: string;
+  taskId: string;
+  headline: string;
+  currentOwnerLabel?: string;
+  nextAction: string;
+  stage: HallTaskStage;
+  blockerCount: number;
+  updatedAt: string;
+}
+
+export interface CollaborationHallStoreSnapshot {
+  halls: CollaborationHall[];
+  executionLocks: ExecutionLock[];
+  updatedAt: string;
+}
+
+export interface CollaborationHallMessageStoreSnapshot {
+  messages: HallMessage[];
+  updatedAt: string;
+}
+
+export interface CollaborationTaskCardStoreSnapshot {
+  taskCards: HallTaskCard[];
+  updatedAt: string;
+}
+
+export interface CollaborationHallSummaryStoreSnapshot {
+  hallSummaries: CollaborationHallSummary[];
+  taskSummaries: HallTaskSummary[];
   updatedAt: string;
 }
 
@@ -193,6 +488,7 @@ export interface TaskListItem {
   title: string;
   status: TaskState;
   owner: string;
+  roomId?: string;
   dueAt?: string;
   sessionKeys: string[];
   updatedAt: string;
