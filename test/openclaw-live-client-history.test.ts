@@ -3,7 +3,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
-import { OpenClawLiveClient } from "../src/clients/openclaw-live-client";
+import { buildWindowsOpenClawCommandLine, OpenClawLiveClient } from "../src/clients/openclaw-live-client";
 
 function attachSessionFile(client: OpenClawLiveClient, sessionKey: string, sessionFile: string): void {
   const internalClient = client as OpenClawLiveClient & {
@@ -12,17 +12,25 @@ function attachSessionFile(client: OpenClawLiveClient, sessionKey: string, sessi
   internalClient.sessionCache.set(sessionKey, { sessionFile });
 }
 
-async function installFakeOpenClawCli(tempDir: string, logPath: string, stdout: string): Promise<string> {
+async function installFakeOpenClawCli(
+  tempDir: string,
+  logPath: string,
+  stdout: string,
+  options: { logMode?: "text" | "json" } = {},
+): Promise<string> {
   const binDir = join(tempDir, "bin");
   await mkdir(binDir, { recursive: true });
 
   const runnerPath = join(binDir, "openclaw-runner.js");
+  const logStatement = options.logMode === "json"
+    ? `fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(process.argv.slice(2)) + '\\n');`
+    : `fs.appendFileSync(${JSON.stringify(logPath)}, process.argv.slice(2).join(' ') + '\\n');`;
   await writeFile(
     runnerPath,
     [
       "#!/usr/bin/env node",
       "const fs = require('node:fs');",
-      `fs.appendFileSync(${JSON.stringify(logPath)}, process.argv.slice(2).join(' ') + '\\n');`,
+      logStatement,
       `process.stdout.write(${JSON.stringify(stdout)});`,
     ].join("\n"),
     "utf8",
@@ -41,6 +49,35 @@ async function installFakeOpenClawCli(tempDir: string, logPath: string, stdout: 
   );
 
   return binDir;
+}
+
+async function installFakeWindowsShell(tempDir: string): Promise<string> {
+  const shellPath = join(tempDir, "cmd.exe");
+  await writeFile(
+    shellPath,
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"/d\" ] && [ \"$2\" = \"/s\" ] && [ \"$3\" = \"/c\" ]; then",
+      "  shift 3",
+      "  exec /bin/sh -lc \"$1\"",
+      "fi",
+      "echo \"unexpected shell args: $*\" >&2",
+      "exit 64",
+    ].join("\n"),
+    "utf8",
+  );
+  await chmod(shellPath, 0o755);
+  return shellPath;
+}
+
+async function withMockPlatform<T>(platform: NodeJS.Platform, callback: () => Promise<T>): Promise<T> {
+  const originalPlatform = process.platform;
+  Object.defineProperty(process, "platform", { value: platform });
+  try {
+    return await callback();
+  } finally {
+    Object.defineProperty(process, "platform", { value: originalPlatform });
+  }
 }
 
 test("sessionsHistory reads recent history from large cached session files", async () => {
@@ -201,6 +238,94 @@ test("agentRun passes message as a flagged argument instead of positional args",
     assert.doesNotMatch(cliLog, /agent pandas hello from hall/);
   } finally {
     process.env.PATH = originalPath;
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("buildWindowsOpenClawCommandLine quotes multiline hall prompts as a single message argument", () => {
+  const message = "line one\nline two with spaces & symbols \"quoted\"";
+  const commandLine = buildWindowsOpenClawCommandLine("C:\\tools\\openclaw.cmd", [
+    "agent",
+    "--agent",
+    "pandas",
+    "--message",
+    message,
+    "--thinking",
+    "minimal",
+  ]);
+
+  assert.match(commandLine, /^C:\\tools\\openclaw\.cmd agent --agent pandas --message "/);
+  assert.match(commandLine, /line one\nline two with spaces & symbols \\"quoted\\"/);
+  assert.match(commandLine, /" --thinking minimal$/);
+});
+
+test("agentRunStream keeps multiline hall prompts intact on the Windows execution path", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "openclaw-agent-stream-win-"));
+  const originalPath = process.env.PATH;
+  const originalBinPath = process.env.OPENCLAW_BIN_PATH;
+  const originalComSpec = process.env.ComSpec;
+  const originalCOMSPEC = process.env.COMSPEC;
+  try {
+    const cliLogPath = join(tempDir, "cli.jsonl");
+    const binDir = await installFakeOpenClawCli(
+      tempDir,
+      cliLogPath,
+      "streamed answer",
+      { logMode: "json" },
+    );
+    const fakeWindowsShell = await installFakeWindowsShell(tempDir);
+    process.env.PATH = binDir + delimiter + (originalPath ?? "");
+    process.env.OPENCLAW_BIN_PATH = join(binDir, "openclaw");
+    process.env.ComSpec = fakeWindowsShell;
+    process.env.COMSPEC = fakeWindowsShell;
+
+    const message = "first line\nsecond line with handoff @pandas";
+    await withMockPlatform("win32", async () => {
+      const client = new OpenClawLiveClient();
+      const chunks: string[] = [];
+      const response = await client.agentRunStream({
+        agentId: "pandas",
+        sessionKey: "agent:pandas:main",
+        message,
+        thinking: "minimal",
+        timeoutSeconds: 5,
+      }, {
+        onStdoutChunk: (chunk) => {
+          chunks.push(chunk);
+        },
+      });
+
+      assert.equal(response.ok, true);
+      assert.equal(response.text, "streamed answer");
+      assert.equal(chunks.join(""), "streamed answer");
+    });
+
+    const cliLog = await readFile(cliLogPath, "utf8");
+    const argv = JSON.parse(cliLog.trim().split("\n").at(-1) ?? "[]") as string[];
+    assert.equal(argv[0], "agent");
+    assert.equal(argv[1], "--session-id");
+    assert.ok(argv[2]);
+    assert.equal(argv[3], "--message");
+    assert.equal(argv[4], message);
+    assert.equal(argv[5], "--thinking");
+    assert.equal(argv[6], "minimal");
+  } finally {
+    process.env.PATH = originalPath;
+    if (originalBinPath === undefined) {
+      delete process.env.OPENCLAW_BIN_PATH;
+    } else {
+      process.env.OPENCLAW_BIN_PATH = originalBinPath;
+    }
+    if (originalComSpec === undefined) {
+      delete process.env.ComSpec;
+    } else {
+      process.env.ComSpec = originalComSpec;
+    }
+    if (originalCOMSPEC === undefined) {
+      delete process.env.COMSPEC;
+    } else {
+      process.env.COMSPEC = originalCOMSPEC;
+    }
     await rm(tempDir, { recursive: true, force: true });
   }
 });

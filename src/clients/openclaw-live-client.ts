@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { exec, execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { open, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -20,8 +20,10 @@ import type {
 } from "../contracts/openclaw-tools";
 import { APPROVAL_ACTIONS_ENABLED } from "../config";
 import { loadCurrentAgentCatalog, resolveOpenClawHomePath } from "../runtime/current-agent-catalog";
+import { buildOpenClawCommandCandidates, buildOpenClawCommandEnv } from "../runtime/openclaw-cli-insights";
 import type { ToolClient } from "./tool-client";
 
+const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 interface SessionCacheItem {
@@ -545,14 +547,40 @@ async function runText(
   args: string[],
   options?: { timeoutMs?: number; maxBuffer?: number; cwd?: string; env?: NodeJS.ProcessEnv },
 ): Promise<string> {
-  const { stdout } = await execFileAsync("openclaw", args, {
-    timeout: options?.timeoutMs ?? 20_000,
-    maxBuffer: options?.maxBuffer ?? 2 * 1024 * 1024,
-    shell: process.platform === "win32",
-    cwd: options?.cwd,
-    env: options?.env,
-  });
-  return stdout;
+  const env = buildOpenClawCommandEnv(options?.env ?? process.env);
+  const candidates = buildOpenClawCommandCandidates(env);
+  let lastError: unknown;
+
+  for (const command of candidates) {
+    try {
+      if (process.platform === "win32") {
+        const commandLine = buildWindowsOpenClawCommandLine(command, args);
+        const { stdout } = await execAsync(commandLine, {
+          timeout: options?.timeoutMs ?? 20_000,
+          maxBuffer: options?.maxBuffer ?? 2 * 1024 * 1024,
+          cwd: options?.cwd,
+          env,
+          windowsHide: true,
+        });
+        return stdout;
+      }
+
+      const { stdout } = await execFileAsync(command, args, {
+        timeout: options?.timeoutMs ?? 20_000,
+        maxBuffer: options?.maxBuffer ?? 2 * 1024 * 1024,
+        cwd: options?.cwd,
+        env,
+      });
+      return stdout;
+    } catch (error) {
+      lastError = error;
+      if (!shouldTryNextOpenClawCommand(error)) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Failed to execute openclaw CLI.");
 }
 
 async function runStreamingText(
@@ -560,47 +588,94 @@ async function runStreamingText(
   handlers: AgentRunStreamHandlers,
   options?: { timeoutMs?: number; cwd?: string; env?: NodeJS.ProcessEnv },
 ): Promise<{ stdout: string; stderr: string; code: number }> {
-  return await new Promise((resolve, reject) => {
-    const child = spawn("openclaw", args, {
-      shell: process.platform === "win32",
-      stdio: ["ignore", "pipe", "pipe"],
-      cwd: options?.cwd,
-      env: options?.env,
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-    }, options?.timeoutMs ?? 20_000);
+  const env = buildOpenClawCommandEnv(options?.env ?? process.env);
+  const candidates = buildOpenClawCommandCandidates(env);
+  let lastError: unknown;
 
-    child.stdout?.setEncoding("utf8");
-    child.stderr?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => {
-      stdout += chunk;
-      handlers.onStdoutChunk?.(chunk);
-    });
-    child.stderr?.on("data", (chunk: string) => {
-      stderr += chunk;
-      handlers.onStderrChunk?.(chunk);
-    });
-    child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({
-        stdout,
-        stderr,
-        code: typeof code === "number" ? code : 0,
+  for (const command of candidates) {
+    try {
+      return await new Promise((resolve, reject) => {
+        const child = process.platform === "win32"
+          ? spawn(resolveWindowsShellCommand(env), ["/d", "/s", "/c", buildWindowsOpenClawCommandLine(command, args)], {
+              shell: false,
+              stdio: ["ignore", "pipe", "pipe"],
+              cwd: options?.cwd,
+              env,
+              windowsHide: true,
+            })
+          : spawn(command, args, {
+              shell: false,
+              stdio: ["ignore", "pipe", "pipe"],
+              cwd: options?.cwd,
+              env,
+            });
+        let stdout = "";
+        let stderr = "";
+        let settled = false;
+        const timer = setTimeout(() => {
+          child.kill("SIGTERM");
+        }, options?.timeoutMs ?? 20_000);
+
+        child.stdout?.setEncoding("utf8");
+        child.stderr?.setEncoding("utf8");
+        child.stdout?.on("data", (chunk: string) => {
+          stdout += chunk;
+          handlers.onStdoutChunk?.(chunk);
+        });
+        child.stderr?.on("data", (chunk: string) => {
+          stderr += chunk;
+          handlers.onStderrChunk?.(chunk);
+        });
+        child.on("error", (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        });
+        child.on("close", (code) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({
+            stdout,
+            stderr,
+            code: typeof code === "number" ? code : 0,
+          });
+        });
       });
-    });
-  });
+    } catch (error) {
+      lastError = error;
+      if (!shouldTryNextOpenClawCommand(error)) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Failed to execute openclaw CLI.");
+}
+
+function shouldTryNextOpenClawCommand(error: unknown): boolean {
+  const root = asObject(error);
+  const code = root?.code;
+  if (code === "ENOENT") return true;
+  if (process.platform !== "win32") return false;
+  const stderr = typeof root?.stderr === "string" ? root.stderr : "";
+  const message = typeof root?.message === "string" ? root.message : "";
+  const combined = `${stderr}\n${message}`;
+  return /not recognized as an internal or external command/i.test(combined) || /cannot find the file specified/i.test(combined);
+}
+
+function quoteWindowsCommand(value: string): string {
+  if (!/[\s"]/u.test(value)) return value;
+  return `"${value.replace(/"/g, '\\"')}"`;
+}
+
+function resolveWindowsShellCommand(env: NodeJS.ProcessEnv): string {
+  return (env.ComSpec ?? env.COMSPEC ?? "cmd.exe").trim() || "cmd.exe";
+}
+
+export function buildWindowsOpenClawCommandLine(command: string, args: string[]): string {
+  return [quoteWindowsCommand(command), ...args.map((item) => quoteWindowsCommand(item))].join(" ");
 }
 
 async function readSessionHistoryFromCli(
